@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: tcc-dengue-postgres
+    environment:
+      POSTGRES_DB: dengue_db
+      POSTGRES_USER: dengue_user
+      POSTGRES_PASSWORD: dengue_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dengue_user -d dengue_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tcc-dengue-app
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://dengue_user:dengue_pass@postgres:5432/dengue_db}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    command: >
+      sh -c "python scripts/wait_for_postgres.py &&
+      streamlit run app/streamlit_app.py --server.address=0.0.0.0 --server.port=8501"
+
+volumes:
+  postgres_data:
