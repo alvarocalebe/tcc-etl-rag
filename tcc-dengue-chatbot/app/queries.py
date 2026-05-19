@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 from typing import Any
 
 import pandas as pd
@@ -745,7 +746,121 @@ def buscar_municipios(nome: str, uf: Any = None) -> pd.DataFrame:
             m.nome_municipio
         LIMIT 10
     """
-    return _read_df(query, params)
+    df = _read_df(query, params)
+    if not df.empty:
+        return df
+
+    return _buscar_municipios_fuzzy(nome_base, uf=uf)
+
+
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _buscar_municipios_fuzzy(nome: str, uf: Any = None) -> pd.DataFrame:
+    nome_base = str(nome or "").strip()
+    if len(nome_base) < 3:
+        return pd.DataFrame()
+
+    prefix = nome_base[: max(3, min(len(nome_base), 5))]
+    params: dict[str, Any] = {"nome_prefix": f"{prefix}%"}
+    uf_clause = ""
+    if uf is not None:
+        u = str(uf).strip().upper()[:2]
+        if len(u) == 2 and not u.startswith("("):
+            params["uf_filtro"] = u
+            uf_clause = " AND m.uf_sigla = :uf_filtro"
+
+    query = f"""
+        SELECT
+            m.id_municipio_ibge,
+            m.nome_municipio,
+            m.uf_sigla
+        FROM municipio m
+        WHERE m.nome_municipio ILIKE :nome_prefix
+        {uf_clause}
+        ORDER BY m.nome_municipio
+        LIMIT 200
+    """
+    candidates = _read_df(query, params)
+    if candidates.empty:
+        return pd.DataFrame()
+
+    target = nome_base.lower()
+    scored = candidates.copy()
+    scored["_score"] = scored["nome_municipio"].astype(str).map(
+        lambda value: _similarity(target, value.lower())
+    )
+    scored = scored[scored["_score"] >= 0.82].sort_values("_score", ascending=False)
+    if scored.empty:
+        return pd.DataFrame()
+    return scored.drop(columns=["_score"]).head(10)
+
+
+def get_ano_mais_recente() -> int | None:
+    df = listar_anos()
+    if df.empty or "ano" not in df.columns:
+        return None
+    try:
+        return int(df["ano"].iloc[0])
+    except Exception:
+        return None
+
+
+def comparar_entidades(
+    entidades: list[dict[str, Any]],
+    ano: int | None = None,
+    metrica: str = "incidencia",
+) -> pd.DataFrame:
+    """
+    Compara indicadores de UFs e/ou municípios em um DataFrame unificado.
+    """
+    del metrica  # Saída sempre inclui casos e incidência.
+
+    rows: list[dict[str, Any]] = []
+    for entidade in entidades or []:
+        tipo = str(entidade.get("tipo") or "").strip().lower()
+        label = str(entidade.get("label") or "").strip()
+        if tipo == "uf":
+            uf = str(entidade.get("uf") or "").strip().upper()[:2]
+            if len(uf) != 2:
+                continue
+            df = get_indicador_municipio(uf=uf, ano=ano)
+            if df.empty:
+                continue
+            row = df.iloc[0].to_dict()
+            row["entidade_label"] = label or uf
+            row["tipo_entidade"] = "uf"
+            rows.append(row)
+        elif tipo == "municipio":
+            nome = str(entidade.get("nome") or "").strip()
+            if not nome:
+                continue
+            uf_hint = entidade.get("uf")
+            df = get_indicador_municipio(municipio=nome, uf=uf_hint, ano=ano)
+            if df.empty:
+                continue
+            row = df.iloc[0].to_dict()
+            municipio_nome = row.get("nome_municipio") or nome
+            uf_sigla = row.get("uf_sigla") or uf_hint
+            row["entidade_label"] = label or (
+                f"{municipio_nome}/{uf_sigla}" if uf_sigla else str(municipio_nome)
+            )
+            row["tipo_entidade"] = "municipio"
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+    if len(result) == 2 and "incidencia_100k" in result.columns:
+        first = pd.to_numeric(result.iloc[0]["incidencia_100k"], errors="coerce")
+        second = pd.to_numeric(result.iloc[1]["incidencia_100k"], errors="coerce")
+        if pd.notna(first) and pd.notna(second) and float(second) != 0.0:
+            diff = round((float(first) - float(second)) / float(second) * 100, 2)
+            result["diferenca_percentual_vs_segunda"] = [diff, -diff]
+
+    return result
 
 
 def listar_ufs() -> pd.DataFrame:

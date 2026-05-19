@@ -12,9 +12,73 @@ from app.db import get_engine
 # Nunca retornar ou solicitar mais que este número de cartas (evita carga excessiva).
 MAX_CARTAS_RAG = 5
 
+# Palavras muito comuns na pergunta que não aparecem nas cartas de fato.
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "ao",
+        "as",
+        "com",
+        "da",
+        "de",
+        "do",
+        "dos",
+        "das",
+        "e",
+        "em",
+        "foi",
+        "foram",
+        "na",
+        "no",
+        "nos",
+        "nas",
+        "o",
+        "os",
+        "ou",
+        "para",
+        "por",
+        "qual",
+        "quais",
+        "que",
+        "se",
+        "sem",
+        "um",
+        "uma",
+        "como",
+        "mostre",
+        "mostrar",
+        "dengue",
+        "incidencia",
+        "incidência",
+        "casos",
+        "total",
+        "evolucao",
+        "evolução",
+    }
+)
+
 
 def _normalize_text(s: Any) -> str:
     return str(s or "").strip()
+
+
+def _terms_from_question(pergunta: str, *, max_terms: int = 4) -> list[str]:
+    """Extrai termos buscáveis da pergunta (não usa a frase inteira)."""
+    import re
+    import unicodedata
+
+    s = unicodedata.normalize("NFD", pergunta.lower())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    raw = re.findall(r"[a-z0-9]{3,}", s)
+    out: list[str] = []
+    for tok in raw:
+        if tok in _STOPWORDS or tok.isdigit():
+            continue
+        if tok not in out:
+            out.append(tok)
+        if len(out) >= max_terms:
+            break
+    return out
 
 
 def retrieve_context(
@@ -40,11 +104,7 @@ def retrieve_context(
         conditions: list[str] = []
         params: dict[str, Any] = {}
 
-        # Busca textual simples
-        params["q"] = f"%{pergunta_norm}%"
-        conditions.append("cf.texto ILIKE :q")
-
-        # Filtros opcionais
+        # Filtros estruturados (NLU / sidebar)
         municipio = filtros.get("municipio")
         if municipio:
             params["municipio"] = f"%{str(municipio).strip()}%"
@@ -65,9 +125,31 @@ def retrieve_context(
             params["semana"] = int(semana)
             conditions.append("cf.semana_epidemiologica = :semana")
 
-        where = " AND ".join(conditions)
+        has_structural = bool(
+            municipio or uf or ano is not None or semana is not None
+        )
 
-        # Ordenação simples: prioriza correspondência no texto (mais "curta" fica mais alta)
+        # Busca textual: a pergunta inteira quase nunca aparece na carta ("Em Palmas/TO...").
+        # Com filtros estruturados, basta município/UF/ano/semana; sem filtros, usa termos-chave.
+        if not has_structural:
+            terms = _terms_from_question(pergunta_norm)
+            if terms:
+                term_conds: list[str] = []
+                for i, term in enumerate(terms):
+                    key = f"term_{i}"
+                    params[key] = f"%{term}%"
+                    term_conds.append(f"cf.texto ILIKE :{key}")
+                conditions.append("(" + " OR ".join(term_conds) + ")")
+            else:
+                params["q"] = f"%{pergunta_norm}%"
+                conditions.append("cf.texto ILIKE :q")
+
+        if not conditions:
+            return []
+
+        where = " AND ".join(conditions)
+        order_by = "cf.casos DESC NULLS LAST, cf.semana_epidemiologica DESC"
+
         query = f"""
             SELECT
                 cf.texto,
@@ -82,7 +164,7 @@ def retrieve_context(
             FROM carta_de_fato cf
             JOIN fato_indicador fi ON fi.id_indicador = cf.id_indicador
             WHERE {where}
-            ORDER BY cf.texto ASC
+            ORDER BY {order_by}
             LIMIT {lim}
         """
 

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import unicodedata
+from difflib import SequenceMatcher
 from typing import Any
 
 from openai import OpenAI
@@ -81,6 +82,16 @@ STATE_NAME_TO_UF = {
     "tocantins": "TO",
 }
 
+# Siglas que também são palavras comuns — só aceitar com contexto explícito.
+AMBIGUOUS_UF_SIGLAS = {"AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"}
+
+UF_FUZZY_MIN_SCORE = 0.82
+
+UF_TO_STATE_LABEL = {
+    uf: name.title()
+    for name, uf in STATE_NAME_TO_UF.items()
+}
+
 OPENAI_TIMEOUT_S = 20.0
 
 
@@ -116,6 +127,7 @@ def _default_interpretation() -> dict[str, Any]:
         "intencao": "desconhecida",
         "municipios": [],
         "ufs": [],
+        "entidades": [],
         "ano": None,
         "semana": None,
         "metrica": "casos",
@@ -151,19 +163,137 @@ def _extract_limit(question: str) -> int:
     return 10
 
 
-def _extract_ufs(question: str) -> list[str]:
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _fuzzy_match_state_name(name: str) -> tuple[str | None, float]:
+    norm = _norm(name)
+    if not norm or len(norm) < 3:
+        return None, 0.0
+
+    if norm in STATE_NAME_TO_UF:
+        return STATE_NAME_TO_UF[norm], 1.0
+
+    best_uf: str | None = None
+    best_score = 0.0
+    for state_name, uf in STATE_NAME_TO_UF.items():
+        score = _similarity(norm, state_name)
+        if score > best_score:
+            best_score = score
+            best_uf = uf
+
+    min_score = UF_FUZZY_MIN_SCORE if len(norm) >= 6 else 0.9
+    if best_score >= min_score:
+        return best_uf, best_score
+    return None, best_score
+
+
+def resolve_uf(term: str) -> str | None:
+    """
+    Resolve sigla ou nome de estado (com tolerância a maiúsculas/minúsculas e typos leves).
+    """
+    raw = str(term or "").strip()
+    if not raw:
+        return None
+
+    sigla = raw.upper()[:2]
+    if len(sigla) == 2 and sigla in UF_SIGLAS and re.fullmatch(r"[A-Za-z]{2}", raw.strip()):
+        return sigla
+
+    uf, _ = _fuzzy_match_state_name(raw)
+    return uf
+
+
+def is_likely_state_name(term: str) -> bool:
+    norm = _norm(term)
+    if not norm:
+        return False
+    if norm in STATE_NAME_TO_UF:
+        return True
+    uf, score = _fuzzy_match_state_name(term)
+    return uf is not None and score >= UF_FUZZY_MIN_SCORE and len(norm) >= 5
+
+
+def normalize_ufs(ufs: list[str]) -> list[str]:
+    resolved: list[str] = []
+    for raw in ufs or []:
+        uf = resolve_uf(raw)
+        if uf:
+            resolved.append(uf)
+        else:
+            sigla = str(raw).strip().upper()[:2]
+            if sigla in UF_SIGLAS:
+                resolved.append(sigla)
+    return _dedupe_strs(resolved)
+
+
+def _extract_ufs_from_siglas(question: str) -> list[str]:
+    text = str(question or "")
+    text_norm = _norm(text)
+    ufs: list[str] = []
+
+    for pattern in (
+        r"\b(?:do|da|de|no|na|em|uf|estado)\s+([A-Za-z]{2})\b",
+        r"\b([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\- ]+?)\s+([A-Za-z]{2})\s+(?:em|no|na)\s+(?:19\d{2}|20\d{2})\b",
+        r"\b([A-Za-z]{2})\s+(?:em|no|na)\s+(?:19\d{2}|20\d{2})\b",
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            candidate = match.group(match.lastindex or 1).upper()
+            if candidate in UF_SIGLAS:
+                ufs.append(candidate)
+
+    for uf in sorted(UF_SIGLAS):
+        if uf in AMBIGUOUS_UF_SIGLAS:
+            continue
+        if re.search(rf"\b{uf}\b", text.upper()):
+            ufs.append(uf)
+
+    for uf in sorted(AMBIGUOUS_UF_SIGLAS):
+        if re.search(rf"\b(?:do|da|de|no|na|em|uf|estado)\s+{uf}\b", text, flags=re.IGNORECASE):
+            ufs.append(uf)
+        if re.search(rf"\b([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\- ]+?)\s+{uf}\b", text, flags=re.IGNORECASE):
+            ufs.append(uf)
+
+    return _dedupe_strs(ufs)
+
+
+def _extract_ufs_from_state_names(question: str) -> list[str]:
     text_norm = _norm(question)
     ufs: list[str] = []
 
-    for state_name, uf in STATE_NAME_TO_UF.items():
+    for state_name, uf in sorted(STATE_NAME_TO_UF.items(), key=lambda item: len(item[0]), reverse=True):
         if re.search(rf"\b{re.escape(state_name)}\b", text_norm):
             ufs.append(uf)
 
-    upper = str(question or "").upper()
-    for uf in sorted(UF_SIGLAS):
-        if re.search(rf"\b{uf}\b", upper):
+    for match in re.finditer(
+        r"\b(?:do|da|de|no|na|em|estado|uf)\s+([a-zà-ÿ\s]{2,30}?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
+        text_norm,
+    ):
+        phrase = match.group(1).strip()
+        words = phrase.split()
+        for size in range(min(4, len(words)), 0, -1):
+            candidate = " ".join(words[:size])
+            uf, score = _fuzzy_match_state_name(candidate)
+            if uf and score >= UF_FUZZY_MIN_SCORE:
+                ufs.append(uf)
+                break
+
+    tokens = re.findall(r"[a-zà-ÿ]{4,}", text_norm)
+    for token in tokens:
+        if token in STATE_NAME_TO_UF:
+            continue
+        uf, score = _fuzzy_match_state_name(token)
+        if uf and score >= 0.9 and len(token) >= 6:
             ufs.append(uf)
+
     return _dedupe_strs(ufs)
+
+
+def _extract_ufs(question: str) -> list[str]:
+    ufs = _extract_ufs_from_state_names(question)
+    ufs.extend(_extract_ufs_from_siglas(question))
+    return normalize_ufs(ufs)
 
 
 def _split_location_and_uf(location: str) -> tuple[str, str | None]:
@@ -182,6 +312,17 @@ def _split_location_and_uf(location: str) -> tuple[str, str | None]:
             return nome, uf
         if norm_raw == state_name:
             return "", uf
+
+    parts = raw.split()
+    if len(parts) >= 2:
+        tail = parts[-1]
+        uf = resolve_uf(tail)
+        if uf and re.fullmatch(r"[A-Za-z]{2}", tail.strip()):
+            return " ".join(parts[:-1]).strip(), uf
+
+    uf, score = _fuzzy_match_state_name(raw)
+    if uf and score >= UF_FUZZY_MIN_SCORE and len(norm_raw) >= 5:
+        return "", uf
     return raw, None
 
 
@@ -195,6 +336,78 @@ def _clean_location_phrase(location: str) -> str:
     )
     value = re.sub(r"\s{2,}", " ", value).strip(" .,:;?!")
     return value
+
+
+def _strip_metric_prefix(phrase: str) -> str:
+    value = str(phrase or "").strip(" .,:;?!")
+    value = re.sub(
+        r"^(?:a\s+)?(?:media|média|incidencia|incidência)\s+(?:do|da|de)\s+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value.strip(" .,:;?!")
+
+
+def _uf_label(uf: str) -> str:
+    sigla = str(uf or "").strip().upper()[:2]
+    nome = UF_TO_STATE_LABEL.get(sigla, sigla)
+    return f"{nome} ({sigla})"
+
+
+def _parse_location_entity(raw: str) -> dict[str, Any] | None:
+    cleaned = _strip_metric_prefix(_clean_location_phrase(raw))
+    if not cleaned:
+        return None
+
+    nome, uf_hint = _split_location_and_uf(cleaned)
+
+    if not nome and uf_hint:
+        return {"tipo": "uf", "uf": uf_hint, "nome": None, "label": _uf_label(uf_hint)}
+
+    if not nome:
+        uf = resolve_uf(cleaned)
+        if uf:
+            return {"tipo": "uf", "uf": uf, "nome": None, "label": _uf_label(uf)}
+        return None
+
+    if is_likely_state_name(nome) and not uf_hint:
+        uf = resolve_uf(nome)
+        if uf:
+            return {"tipo": "uf", "uf": uf, "nome": None, "label": _uf_label(uf)}
+
+    label = f"{nome}/{uf_hint}" if uf_hint else nome
+    return {"tipo": "municipio", "nome": nome, "uf": uf_hint, "label": label}
+
+
+def _extract_comparison_entities(question: str) -> list[dict[str, Any]]:
+    text = str(question or "").strip()
+    if not text:
+        return []
+
+    compare_patterns = (
+        r"\b(?:compare|comparar|comparacao|comparação)\s+(.+?)\s+(?:com|com a|versus|vs\.?|e)\s+(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
+        r"(?:media|média)\s+(?:do|da|de)\s+(.+?)\s+(?:com|com a|versus|vs\.?|e)\s+(?:a\s+)?(?:media|média)\s+(?:do|da|de)\s+(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
+        r"\b(.+?)\s+(?:versus|vs\.?)\s+(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
+    )
+
+    for pattern in compare_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        left = _parse_location_entity(match.group(1))
+        right = _parse_location_entity(match.group(2))
+        entities = [entity for entity in (left, right) if entity]
+        if len(entities) >= 2:
+            return entities
+
+    legacy = _extract_compare_municipios(question)
+    entities: list[dict[str, Any]] = []
+    for name in legacy:
+        entity = _parse_location_entity(name)
+        if entity:
+            entities.append(entity)
+    return entities
 
 
 def _extract_compare_municipios(question: str) -> list[str]:
@@ -247,15 +460,26 @@ def _extract_primary_location(question: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _is_comparison_question(question: str) -> bool:
+    text = _norm(question)
+    if re.search(r"\b(?:compare|comparar|comparacao|comparacao|versus|vs\.?)\b", text):
+        return True
+    if re.search(r"(?:media|média).*\b(?:com|com a|versus|vs\.?| e )\b", question, flags=re.IGNORECASE):
+        return True
+    return False
+
+
 def _detect_intent(question: str) -> str:
     text = _norm(question)
 
     if any(key in text for key in ["semana com mais casos", "pico epidemiologico", "pico epidemiológico", "pico de casos"]):
         return "pico"
-    if any(key in text for key in ["acima da media", "abaixo da media", "acima da média", "abaixo da média", "media do", "média do", "media estadual", "média estadual"]):
-        return "media_estado"
-    if any(key in text for key in ["compare", "comparar", "comparacao", "comparação"]):
+    if _is_comparison_question(question):
         return "comparacao"
+    if any(key in text for key in ["acima da media", "abaixo da media", "acima da média", "abaixo da média", "media estadual", "média estadual"]):
+        return "media_estado"
+    if any(key in text for key in ["media do", "média do"]) and not _is_comparison_question(question):
+        return "media_estado"
     if any(key in text for key in ["aumentando", "tendencia", "tendência", "ultimas semanas", "últimas semanas"]):
         return "tendencia"
     if any(key in text for key in ["ranking", "maior incidencia", "maior incidência", "maiores incidencias", "maiores incidências", "maior incid", "mais casos", "quais cidades", "quais municipios", "quais municípios"]):
@@ -272,7 +496,9 @@ def _detect_metric(question: str, intent: str) -> str:
     if intent in {"incidencia", "media_estado"}:
         return "incidencia"
     if intent == "comparacao":
-        return "incidencia" if "incid" in text else "incidencia"
+        if any(key in text for key in ["media", "média", "incid"]):
+            return "incidencia"
+        return "casos"
     if intent == "ranking":
         return "incidencia" if "incid" in text else "casos"
     if any(key in text for key in ["incidencia", "incidência", "100 mil"]):
@@ -307,8 +533,7 @@ def _normalize_interpretation(raw: dict[str, Any] | None) -> dict[str, Any]:
     ufs = data.get("ufs") or []
     if isinstance(ufs, str):
         ufs = [ufs]
-    data["ufs"] = _dedupe_strs([str(u).strip().upper()[:2] for u in ufs if str(u).strip()])
-    data["ufs"] = [uf for uf in data["ufs"] if uf in UF_SIGLAS]
+    data["ufs"] = normalize_ufs([str(u).strip() for u in ufs if str(u).strip()])
 
     for key in ("ano", "semana", "limite"):
         value = data.get(key)
@@ -333,6 +558,47 @@ def _normalize_interpretation(raw: dict[str, Any] | None) -> dict[str, Any]:
     if data["semana"] is not None and not (1 <= int(data["semana"]) <= 53):
         data["semana"] = None
 
+    entidades = data.get("entidades") or []
+    if isinstance(entidades, dict):
+        entidades = [entidades]
+    normalized_entities: list[dict[str, Any]] = []
+    for raw_entity in entidades:
+        if not isinstance(raw_entity, dict):
+            continue
+        tipo = str(raw_entity.get("tipo") or "").strip().lower()
+        if tipo not in {"uf", "municipio"}:
+            continue
+        entity: dict[str, Any] = {"tipo": tipo}
+        if tipo == "uf":
+            uf = resolve_uf(str(raw_entity.get("uf") or raw_entity.get("nome") or ""))
+            if not uf:
+                continue
+            entity["uf"] = uf
+            entity["nome"] = None
+            entity["label"] = str(raw_entity.get("label") or _uf_label(uf))
+        else:
+            nome = str(raw_entity.get("nome") or raw_entity.get("municipio") or "").strip()
+            if len(nome) < 2:
+                continue
+            uf_hint = resolve_uf(str(raw_entity.get("uf") or "")) if raw_entity.get("uf") else None
+            entity["nome"] = nome
+            entity["uf"] = uf_hint
+            entity["label"] = str(raw_entity.get("label") or (f"{nome}/{uf_hint}" if uf_hint else nome))
+        normalized_entities.append(entity)
+    data["entidades"] = normalized_entities
+
+    municipios = list(data.get("municipios") or [])
+    ufs = list(data.get("ufs") or [])
+    for entity in normalized_entities:
+        if entity["tipo"] == "uf" and entity.get("uf"):
+            ufs.append(str(entity["uf"]))
+        elif entity["tipo"] == "municipio" and entity.get("nome"):
+            municipios.append(str(entity["nome"]))
+            if entity.get("uf"):
+                ufs.append(str(entity["uf"]))
+    data["municipios"] = _dedupe_strs(municipios)
+    data["ufs"] = normalize_ufs([str(u) for u in ufs if str(u).strip()])
+
     return data
 
 
@@ -349,7 +615,12 @@ def _build_rule_based_interpretation(question: str) -> dict[str, Any]:
     municipios: list[str] = []
 
     if out["intencao"] == "comparacao":
-        municipios = _extract_compare_municipios(question)
+        out["entidades"] = _extract_comparison_entities(question)
+        municipios = [
+            str(entity["nome"])
+            for entity in out["entidades"]
+            if entity.get("tipo") == "municipio" and entity.get("nome")
+        ]
     else:
         municipio, uf_local = _extract_primary_location(question)
         if municipio:
@@ -367,12 +638,49 @@ def _build_rule_based_interpretation(question: str) -> dict[str, Any]:
     return _normalize_interpretation(out)
 
 
+def relocate_state_names(interpretacao: dict[str, Any]) -> dict[str, Any]:
+    """
+    Move termos que parecem nome de estado da lista de municípios para UFs.
+    """
+    data = dict(interpretacao or {})
+    municipios = list(data.get("municipios") or [])
+    ufs = list(data.get("ufs") or [])
+    kept: list[str] = []
+
+    for term in municipios:
+        if is_likely_state_name(term):
+            uf = resolve_uf(term)
+            if uf:
+                ufs.append(uf)
+                continue
+        kept.append(term)
+
+    data["municipios"] = _dedupe_strs(kept)
+    data["ufs"] = normalize_ufs(ufs)
+    return data
+
+
+def count_valid_entities(parsed: dict[str, Any]) -> int:
+    entidades = list(parsed.get("entidades") or [])
+    if entidades:
+        return len(entidades)
+    municipios = list(parsed.get("municipios") or [])
+    ufs = list(parsed.get("ufs") or [])
+    if parsed.get("intencao") == "comparacao":
+        return len(municipios) + len(ufs)
+    return len(municipios) + len(ufs)
+
+
 def _should_try_llm(parsed: dict[str, Any]) -> bool:
     if parsed["intencao"] == "desconhecida":
         return True
-    if parsed["intencao"] in {"comparacao"} and len(parsed["municipios"]) < 2:
+    if parsed["intencao"] == "comparacao" and count_valid_entities(parsed) < 2:
         return True
-    if parsed["intencao"] in {"incidencia", "total", "tendencia", "media_estado", "pico"} and not parsed["municipios"] and not parsed["ufs"]:
+    if parsed["intencao"] == "media_estado" and not parsed["municipios"]:
+        return True
+    if parsed["intencao"] in {"incidencia", "total", "tendencia", "pico"} and not parsed["municipios"] and not parsed["ufs"]:
+        return True
+    if _is_comparison_question(str(parsed.get("_pergunta_original") or "")) and count_valid_entities(parsed) < 2:
         return True
     return False
 
@@ -385,18 +693,32 @@ def _try_llm_interpretation(question: str) -> dict[str, Any] | None:
     client = OpenAI(api_key=api_key, timeout=OPENAI_TIMEOUT_S)
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     system_prompt = (
-        "Você interpreta perguntas epidemiológicas sobre dengue. "
+        "Você interpreta perguntas epidemiológicas sobre dengue no Brasil. "
         "Retorne somente JSON válido, sem markdown e sem texto extra. "
-        "Campos obrigatórios: intencao, municipios, ufs, ano, semana, metrica, periodo, limite. "
-        "Intenções válidas: incidencia, total, ranking, comparacao, tendencia, media_estado, pico, desconhecida."
+        "Campos obrigatórios: intencao, municipios, ufs, entidades, ano, semana, metrica, periodo, limite. "
+        "Intenções válidas: incidencia, total, ranking, comparacao, tendencia, media_estado, pico, desconhecida. "
+        "Use entidades para comparações mistas entre UF e município. "
+        "Cada entidade deve ter: tipo (uf|municipio), uf, nome, label."
     )
     user_prompt = (
         f"Pergunta: {question}\n\n"
+        "Exemplos:\n"
+        '1) "compare a média do parana com a média de palmas to" -> '
+        '{"intencao":"comparacao","entidades":[{"tipo":"uf","uf":"PR","nome":null,"label":"Parana (UF)"},'
+        '{"tipo":"municipio","nome":"Palmas","uf":"TO","label":"Palmas/TO"}],"metrica":"incidencia"}\n'
+        '2) "compare sao paulo e rio de janeiro em 2025" -> '
+        '{"intencao":"comparacao","entidades":[{"tipo":"uf","uf":"SP","nome":null,"label":"Sao Paulo (UF)"},'
+        '{"tipo":"uf","uf":"RJ","nome":null,"label":"Rio de Janeiro (UF)"}],"ano":2025,"metrica":"incidencia"}\n'
+        '3) "Palmas está acima da média do Tocantins em 2025" -> '
+        '{"intencao":"media_estado","municipios":["Palmas"],"ufs":["TO"],"ano":2025,"metrica":"incidencia"}\n'
+        '4) "qual a incidencia em araguaina" -> '
+        '{"intencao":"incidencia","municipios":["Araguaína"],"metrica":"incidencia"}\n\n'
         "Retorne JSON no formato:\n"
         "{\n"
         '  "intencao": "incidencia | total | ranking | comparacao | tendencia | media_estado | pico | desconhecida",\n'
         '  "municipios": ["Palmas"],\n'
         '  "ufs": ["TO"],\n'
+        '  "entidades": [{"tipo":"uf","uf":"PR","nome":null,"label":"Parana (UF)"}],\n'
         '  "ano": 2025,\n'
         '  "semana": null,\n'
         '  "metrica": "casos | incidencia",\n'
@@ -433,19 +755,25 @@ def interpret_question(pergunta: str) -> dict[str, Any]:
     2. OpenAI somente se necessário, retornando apenas JSON.
     3. Fallback final: resultado por regras.
     """
-    base = _build_rule_based_interpretation(pergunta)
+    base = relocate_state_names(_build_rule_based_interpretation(pergunta))
+    base["_pergunta_original"] = pergunta
     if _should_try_llm(base):
         llm_data = _try_llm_interpretation(pergunta)
         if llm_data:
-            merged = _normalize_interpretation(
-                {
-                    **llm_data,
-                    "ano": llm_data.get("ano") if llm_data.get("ano") is not None else base.get("ano"),
-                    "semana": llm_data.get("semana") if llm_data.get("semana") is not None else base.get("semana"),
-                    "municipios": llm_data.get("municipios") or base.get("municipios"),
-                    "ufs": llm_data.get("ufs") or base.get("ufs"),
-                    "limite": llm_data.get("limite") or base.get("limite"),
-                }
+            merged = relocate_state_names(
+                _normalize_interpretation(
+                    {
+                        **llm_data,
+                        "ano": llm_data.get("ano") if llm_data.get("ano") is not None else base.get("ano"),
+                        "semana": llm_data.get("semana") if llm_data.get("semana") is not None else base.get("semana"),
+                        "municipios": llm_data.get("municipios") or base.get("municipios"),
+                        "ufs": llm_data.get("ufs") or base.get("ufs"),
+                        "entidades": llm_data.get("entidades") or base.get("entidades"),
+                        "limite": llm_data.get("limite") or base.get("limite"),
+                    }
+                )
             )
+            merged.pop("_pergunta_original", None)
             return merged
+    base.pop("_pergunta_original", None)
     return base

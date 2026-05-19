@@ -86,19 +86,35 @@ def generate_answer(
 
     system_prompt = (
         "Você é um assistente analítico de saúde pública especializado em dengue.\n"
-        "Responda em português brasileiro, com linguagem clara e objetiva.\n"
+        "Responda em português brasileiro, de forma conversacional, clara e objetiva — "
+        "como um analista explicando resultados para um gestor.\n"
         "Use somente os dados calculados por SQL/Python e o contexto RAG fornecido.\n"
         "Não invente números.\n"
         "Não faça cálculos novos.\n"
-        "Explique a metodologia quando houver incidência: incidência = casos / população × 100.000.\n"
+        "Não explique fórmulas nem metodologia de incidência; cite apenas os valores já calculados.\n"
+        "Se houver ano_assumido em DADOS_CALCULADOS, informe explicitamente que o ano foi assumido "
+        "como o mais recente disponível.\n"
+        "Em comparações, destaque quem tem maior incidência ou casos e use diferenca_percentual "
+        "somente se já estiver presente nos dados.\n"
+        "Se faltarem dados, explique o que falta e sugira como reformular a pergunta.\n"
         "Sempre informe fontes: Sinan/Dengue para casos e IBGE para população.\n"
-        "Quando houver limitações, mencione de forma breve.\n"
-        "Formato da resposta:\n"
+        "Formato sugerido:\n"
         "1. Resposta direta.\n"
-        "2. Dados principais.\n"
-        "3. Interpretação.\n"
-        "4. Fontes e metodologia."
+        "2. Dados principais (por entidade comparada, se houver).\n"
+        "3. Interpretação breve.\n"
+        "4. Fontes."
     )
+
+    extra_notes: list[str] = []
+    if isinstance(dados_calculados, dict):
+        if dados_calculados.get("ano_assumido"):
+            extra_notes.append(
+                f"- O ano {dados_calculados['ano_assumido']} foi assumido por ser o mais recente disponível."
+            )
+        if dados_calculados.get("tipo_consulta") == "comparacao":
+            extra_notes.append(
+                "- Esta é uma pergunta comparativa: organize a resposta por entidade e indique qual ficou acima/abaixo."
+            )
 
     user_prompt = (
         f"PERGUNTA: {pergunta}\n\n"
@@ -107,8 +123,9 @@ def generate_answer(
         "TAREFA:\n"
         "- Responder com base apenas nas seções acima.\n"
         "- Não calcular valores além dos já presentes em DADOS_CALCULADOS.\n"
-        "- Quando houver incidência nos dados, explique brevemente a metodologia.\n"
-        "- Se faltarem dados, diga isso claramente.\n\n"
+        "- Não incluir fórmulas matemáticas nem parágrafo sobre metodologia de incidência.\n"
+        + ("\n".join(extra_notes) + "\n" if extra_notes else "")
+        + "- Se faltarem dados, diga isso claramente e sugira uma pergunta alternativa concreta.\n\n"
         f"{_sources_note(dados_calculados, contexto_rag)}"
     )
 
@@ -148,3 +165,5 @@ def generate_answer(
             "Dados calculados (SQL) para referência:\n"
             + _format_json(dados_calculados)
         )
+
+

@@ -88,6 +88,10 @@ def _merge_ui_filters(
     ui_uf = _normalize_uf(ui.get("uf") or ui.get("uf_sigla"))
     if ui_uf:
         merged["ufs"] = [ui_uf]
+    elif ui.get("uf") or ui.get("uf_sigla"):
+        resolved = nlu.resolve_uf(str(ui.get("uf") or ui.get("uf_sigla")))
+        if resolved:
+            merged["ufs"] = [resolved]
 
     if ui.get("ano") is not None:
         try:
@@ -139,6 +143,11 @@ def _resolve_single_municipio(
     nome_norm = _norm(nome)
     exact = df[df["nome_municipio"].astype(str).map(_norm) == nome_norm].copy()
     pool = exact if not exact.empty else df.copy()
+    fuzzy_note: str | None = None
+    if exact.empty and not pool.empty:
+        chosen_name = str(pool.iloc[0]["nome_municipio"])
+        if _norm(chosen_name) != nome_norm:
+            fuzzy_note = f"Interpretei '{nome}' como '{chosen_name}'."
 
     if nome_norm == "palmas":
         palmas_to = pool[
@@ -164,7 +173,7 @@ def _resolve_single_municipio(
         return {
             "nome": str(chosen["nome_municipio"]),
             "uf": str(chosen["uf_sigla"]).upper(),
-            "nota": None,
+            "nota": fuzzy_note,
             "resposta": None,
         }
 
@@ -173,7 +182,7 @@ def _resolve_single_municipio(
         return {
             "nome": str(chosen["nome_municipio"]),
             "uf": str(chosen["uf_sigla"]).upper(),
-            "nota": None,
+            "nota": fuzzy_note,
             "resposta": None,
         }
 
@@ -207,18 +216,90 @@ def _resolve_municipios(
     return _dedupe_strs(resolved_names), _dedupe_strs(resolved_ufs), _dedupe_strs(notes), None
 
 
+def _resolve_entidades(
+    interpretacao: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str], str | None]:
+    entidades = list(interpretacao.get("entidades") or [])
+    notes: list[str] = []
+    resolved: list[dict[str, Any]] = []
+
+    for entidade in entidades:
+        tipo = str(entidade.get("tipo") or "").strip().lower()
+        if tipo == "uf":
+            uf = _normalize_uf(entidade.get("uf"))
+            if not uf:
+                continue
+            resolved.append(
+                {
+                    "tipo": "uf",
+                    "uf": uf,
+                    "nome": None,
+                    "label": str(entidade.get("label") or f"{uf} (UF)"),
+                }
+            )
+            continue
+
+        if tipo != "municipio":
+            continue
+
+        nome = str(entidade.get("nome") or "").strip()
+        uf_hint = _normalize_uf(entidade.get("uf"))
+        if not nome:
+            continue
+
+        result = _resolve_single_municipio(nome, uf_hint=uf_hint)
+        if result["resposta"]:
+            return [], notes, str(result["resposta"])
+        if not result["nome"]:
+            continue
+
+        resolved_name = str(result["nome"])
+        resolved_uf = _normalize_uf(result["uf"]) or uf_hint
+        label = f"{resolved_name}/{resolved_uf}" if resolved_uf else resolved_name
+        resolved.append(
+            {
+                "tipo": "municipio",
+                "nome": resolved_name,
+                "uf": resolved_uf,
+                "label": str(entidade.get("label") or label),
+            }
+        )
+        if result["nota"]:
+            notes.append(str(result["nota"]))
+
+    return resolved, _dedupe_strs(notes), None
+
+
+def _apply_default_year(interpretacao: dict[str, Any]) -> tuple[dict[str, Any], int | None]:
+    data = dict(interpretacao or {})
+    if data.get("ano") is not None:
+        return data, None
+    ano = queries.get_ano_mais_recente()
+    if ano is None:
+        return data, None
+    data["ano"] = int(ano)
+    return data, int(ano)
+
+
+def _is_municipio_only_comparison(entidades: list[dict[str, Any]]) -> bool:
+    if len(entidades) != 2:
+        return False
+    return all(str(item.get("tipo") or "") == "municipio" for item in entidades)
+
+
 def _need_more_filters_message(interp: dict[str, Any]) -> str | None:
     intent = str(interp.get("intencao") or "desconhecida")
     municipios = list(interp.get("municipios") or [])
     ufs = list(interp.get("ufs") or [])
+    entidades = list(interp.get("entidades") or [])
     ano = interp.get("ano")
 
     if intent == "incidencia" and not (municipios or ufs):
         return "Informe o município ou UF para calcular a incidência."
     if intent == "ranking" and not (ufs or ano):
         return "Informe pelo menos a UF ou o ano para montar o ranking."
-    if intent == "comparacao" and len(municipios) < 2:
-        return "Informe pelo menos dois municípios para comparar."
+    if intent == "comparacao" and len(entidades) < 2 and len(municipios) < 2:
+        return "Informe pelo menos duas localidades para comparar (municípios, UFs ou uma combinação)."
     if intent == "tendencia" and not municipios:
         return "Informe o município para analisar a tendência nas últimas semanas."
     if intent == "media_estado" and not municipios:
@@ -316,19 +397,43 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
     interpretacao["_pergunta_original"] = pergunta
     logger.info("[CHATBOT] depois NLU interpretacao=%s", interpretacao)
 
-    resolved_names, resolved_ufs, notes, ambiguity = _resolve_municipios(interpretacao)
-    if ambiguity:
-        logger.info("[CHATBOT] ambiguidade de município: %s", ambiguity)
-        interpretacao["municipios"] = list(interpretacao.get("municipios") or [])
-        interpretacao["observacoes"] = notes
-        return _empty_result(ambiguity, interpretacao=interpretacao, filtros_ui=filtros_ui)
+    intent = str(interpretacao.get("intencao") or "desconhecida")
+    notes: list[str] = list(interpretacao.get("observacoes") or [])
 
-    if resolved_names:
-        interpretacao["municipios"] = resolved_names
-    if resolved_ufs:
-        interpretacao["ufs"] = _dedupe_strs(resolved_ufs + list(interpretacao.get("ufs") or []))
+    if intent == "comparacao" and interpretacao.get("entidades"):
+        entidades, ent_notes, ambiguity = _resolve_entidades(interpretacao)
+        if ambiguity:
+            logger.info("[CHATBOT] ambiguidade de entidade: %s", ambiguity)
+            interpretacao["observacoes"] = ent_notes
+            return _empty_result(ambiguity, interpretacao=interpretacao, filtros_ui=filtros_ui)
+        interpretacao["entidades"] = entidades
+        notes.extend(ent_notes)
+        interpretacao["municipios"] = [
+            str(item["nome"])
+            for item in entidades
+            if item.get("tipo") == "municipio" and item.get("nome")
+        ]
+        interpretacao["ufs"] = _dedupe_strs(
+            [str(item["uf"]) for item in entidades if item.get("tipo") == "uf" and item.get("uf")]
+            + [str(item["uf"]) for item in entidades if item.get("tipo") == "municipio" and item.get("uf")]
+        )
+    else:
+        resolved_names, resolved_ufs, mun_notes, ambiguity = _resolve_municipios(interpretacao)
+        if ambiguity:
+            logger.info("[CHATBOT] ambiguidade de município: %s", ambiguity)
+            interpretacao["municipios"] = list(interpretacao.get("municipios") or [])
+            interpretacao["observacoes"] = mun_notes
+            return _empty_result(ambiguity, interpretacao=interpretacao, filtros_ui=filtros_ui)
+
+        if resolved_names:
+            interpretacao["municipios"] = resolved_names
+        if resolved_ufs:
+            interpretacao["ufs"] = _dedupe_strs(resolved_ufs + list(interpretacao.get("ufs") or []))
+        notes.extend(mun_notes)
+
+    interpretacao, ano_assumido = _apply_default_year(interpretacao)
     if notes:
-        interpretacao["observacoes"] = notes
+        interpretacao["observacoes"] = _dedupe_strs(notes)
 
     filtro_msg = _need_more_filters_message(interpretacao)
     if filtro_msg:
@@ -338,6 +443,7 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
     intent = str(interpretacao.get("intencao") or "desconhecida")
     municipios = list(interpretacao.get("municipios") or [])
     ufs = list(interpretacao.get("ufs") or [])
+    entidades = list(interpretacao.get("entidades") or [])
     municipio = municipios[0] if municipios else None
     uf = _normalize_uf(ufs[0]) if ufs else None
     ano = interpretacao.get("ano")
@@ -367,11 +473,14 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
         "filtros": {
             "municipios": municipios,
             "ufs": ufs,
+            "entidades": entidades,
             "ano": ano,
             "semana": semana,
             "metrica": metrica,
         },
     }
+    if ano_assumido is not None:
+        dados_calculados["ano_assumido"] = ano_assumido
 
     try:
         if intent in {"incidencia", "total"}:
@@ -380,6 +489,18 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
         elif intent == "ranking":
             df = queries.get_ranking(uf=uf, ano=ano, metrica=metrica, limit=limite)
             dados_ui = df
+        elif intent == "comparacao" and len(entidades) >= 2:
+            if _is_municipio_only_comparison(entidades):
+                df = queries.comparar_municipios(
+                    municipios=[str(item["nome"]) for item in entidades],
+                    uf=uf,
+                    ano=ano,
+                    metrica=metrica,
+                )
+            else:
+                df = queries.comparar_entidades(entidades=entidades, ano=ano, metrica=metrica)
+            dados_ui = df
+            dados_calculados["entidades_comparadas"] = entidades
         elif intent == "comparacao":
             df = queries.comparar_municipios(municipios=municipios, uf=uf, ano=ano, metrica=metrica)
             dados_ui = df

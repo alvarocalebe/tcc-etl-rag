@@ -20,7 +20,7 @@ st.set_page_config(
 )
 
 st.title("Chatbot Dengue — ETL + RAG")
-st.caption("ETL + PostgreSQL + RAG simples + OpenAI (MVP).")
+# st.caption("ETL + PostgreSQL + RAG simples + OpenAI (MVP).")
 
 
 def _safe_count() -> tuple[int, int, int]:
@@ -101,6 +101,7 @@ suggestions = [
     "Quantos casos de dengue houve em Palmas TO em 2025?",
     "Quais municípios do TO tiveram maior incidência em 2025?",
     "Compare Palmas e Araguaína em 2025.",
+    "Compare a média do Paraná com a média de Palmas TO.",
     "A dengue está aumentando em Palmas TO nas últimas semanas?",
     "Palmas está acima da média do Tocantins em 2025?",
     "Qual foi a semana com mais casos em Palmas TO em 2025?",
@@ -108,6 +109,12 @@ suggestions = [
 
 if "submit" not in st.session_state:
     st.session_state.submit = False
+if "auto_submit" not in st.session_state:
+    st.session_state.auto_submit = False
+
+pending_question = st.session_state.pop("pergunta_pendente", None)
+if pending_question:
+    st.session_state.pergunta_input = pending_question
 
 filtros_ui: dict[str, object] = {}
 if uf and uf not in ("(sem dados)", "(qualquer)"):
@@ -119,13 +126,8 @@ if ano_val is not None:
 if semana_enabled and semana is not None:
     filtros_ui["semana_epidemiologica"] = int(semana)
 
-default_question = st.session_state.pop("pergunta_sugerida", "")
-if default_question:
-    st.session_state.pop("pergunta_input", None)
+pergunta = st.text_input("Digite sua pergunta", key="pergunta_input")
 
-pergunta = st.text_input(
-    "Digite sua pergunta", value=default_question, key="pergunta_input"
-)
 col_send, col_spacer = st.columns([1, 4])
 with col_send:
     if st.button("Enviar", use_container_width=True):
@@ -136,8 +138,9 @@ for idx, sug in enumerate(suggestions):
     target_col = col1 if idx % 2 == 0 else col2
     with target_col:
         if st.button(sug, key=f"sug_{idx}", use_container_width=True):
-            st.session_state["pergunta_sugerida"] = sug
-            st.session_state.submit = True
+            st.session_state.pergunta_pendente = sug
+            st.session_state.auto_submit = True
+            st.rerun()
 
 
 def _render_result(result: dict) -> None:
@@ -182,11 +185,19 @@ def _render_result(result: dict) -> None:
             st.markdown("### Gráfico (série semanal)")
             st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("Contexto RAG"):
+    with st.expander("Contexto RAG", expanded=False):
         if contexto:
             for i, item in enumerate(contexto, start=1):
-                st.markdown(f"**{i}. {item.get('municipio', '')}/{item.get('uf_sigla', '')}** (ano {item.get('ano', '')}, semana {item.get('semana_epidemiologica', '')})")
+                mun = item.get("municipio") or "—"
+                uf = item.get("uf_sigla") or "—"
+                ano = item.get("ano", "")
+                sem = item.get("semana_epidemiologica", "")
+                st.markdown(
+                    f"**{i}. {mun}/{uf}** (ano {ano}, semana {sem})"
+                )
                 st.write(item.get("texto", ""))
+                if i < len(contexto):
+                    st.markdown("")
         else:
             st.caption("Nenhum contexto encontrado.")
 
@@ -197,8 +208,12 @@ def _render_result(result: dict) -> None:
         st.json(interpretacao)
 
 
+if st.session_state.auto_submit:
+    st.session_state.auto_submit = False
+    st.session_state.submit = True
+
 if st.session_state.submit:
-    pergunta = (pergunta or "").strip()
+    pergunta = (st.session_state.get("pergunta_input") or "").strip()
     if not pergunta:
         st.warning("Digite uma pergunta.")
     else:

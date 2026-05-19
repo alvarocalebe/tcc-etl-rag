@@ -1,6 +1,3 @@
-"""
-Extração de arquivos brutos Dengue/Sinan em data/raw/dengue.
-"""
 
 from __future__ import annotations
 
@@ -10,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Candidatos após normalização de nomes (lowercase, espaços -> _)
 COL_MUNICIPIO = [
     "id_mn_resi",
     "id_municip",
