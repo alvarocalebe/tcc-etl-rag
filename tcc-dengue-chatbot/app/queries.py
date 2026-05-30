@@ -94,10 +94,32 @@ def _municipios_exact_condition(
     params: dict[str, Any],
     *,
     param_prefix: str = "mun_lista",
+    ufs: list[str | None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     clean = [str(m).strip() for m in municipios if str(m).strip()]
     if not clean:
         return "", params
+    hints = list(ufs or [])
+    if hints and len(hints) == len(clean):
+        clauses: list[str] = []
+        out = dict(params)
+        for idx, nome in enumerate(clean):
+            name_key = f"{param_prefix}_nome_{idx}"
+            out[name_key] = nome
+            uf_hint = str(hints[idx] or "").strip().upper()[:2]
+            if len(uf_hint) == 2 and uf_hint.isalpha():
+                uf_key = f"{param_prefix}_uf_{idx}"
+                out[uf_key] = uf_hint
+                clauses.append(
+                    f"(LOWER(TRIM({alias}.nome_municipio)) = LOWER(TRIM(:{name_key})) "
+                    f"AND {alias}.uf_sigla = :{uf_key})"
+                )
+            else:
+                clauses.append(
+                    f"LOWER(TRIM({alias}.nome_municipio)) = LOWER(TRIM(:{name_key}))"
+                )
+        return "(" + " OR ".join(clauses) + ")", out
+
     clauses: list[str] = []
     out = dict(params)
     for idx, nome in enumerate(clean):
@@ -317,22 +339,34 @@ def comparar_municipios(
     uf: Any = None,
     ano: int | None = None,
     metrica: str = "incidencia",
+    *,
+    municipios_uf: list[str | None] | None = None,
 ) -> pd.DataFrame:
     """
     Retorna uma linha por município com casos, população e incidência.
+
+    municipios_uf: UF opcional por município (mesmo tamanho que municipios).
     """
     del metrica  # A saída sempre traz casos e incidência; a interpretação usa ambas.
 
     params: dict[str, Any] = {"limit": MAX_RESULT_LIMIT}
     conditions: list[str] = []
 
-    cond_list, params = _municipios_exact_condition("m", municipios, params)
+    hints = list(municipios_uf or [])
+    per_uf = hints and len(hints) == len(municipios) and len({h for h in hints if h}) > 1
+    cond_list, params = _municipios_exact_condition(
+        "m",
+        municipios,
+        params,
+        ufs=hints if hints and len(hints) == len(municipios) else None,
+    )
     if cond_list:
         conditions.append(cond_list)
 
-    cond_uf, params = _uf_condition("m", uf, params)
-    if cond_uf:
-        conditions.append(cond_uf)
+    if not per_uf:
+        cond_uf, params = _uf_condition("m", uf, params)
+        if cond_uf:
+            conditions.append(cond_uf)
 
     if ano is not None:
         params["ano"] = int(ano)
@@ -364,7 +398,24 @@ def comparar_municipios(
         ORDER BY m.uf_sigla, m.nome_municipio, t.ano
         LIMIT :limit
     """
-    return _read_df(query, params)
+    df = _read_df(query, params)
+    if df.empty:
+        return df
+    labels = []
+    for _, row in df.iterrows():
+        nome = row.get("nome_municipio")
+        uf_sigla = row.get("uf_sigla")
+        if pd.notna(nome) and str(nome).strip():
+            label = str(nome).strip()
+            if pd.notna(uf_sigla) and str(uf_sigla).strip():
+                label = f"{label}/{uf_sigla}"
+        else:
+            label = str(uf_sigla or "Município")
+        labels.append(label)
+    df = df.copy()
+    df["entidade_label"] = labels
+    df["tipo_entidade"] = "municipio"
+    return df
 
 
 def get_serie_semanal(
@@ -838,8 +889,15 @@ def comparar_entidades(
                 continue
             uf_hint = entidade.get("uf")
             df = get_indicador_municipio(municipio=nome, uf=uf_hint, ano=ano)
+            if df.empty and uf_hint:
+                df = get_indicador_municipio(municipio=nome, uf=None, ano=ano)
             if df.empty:
                 continue
+            if uf_hint and "uf_sigla" in df.columns:
+                uf_norm = str(uf_hint).strip().upper()[:2]
+                scoped = df[df["uf_sigla"].astype(str).str.upper() == uf_norm]
+                if not scoped.empty:
+                    df = scoped
             row = df.iloc[0].to_dict()
             municipio_nome = row.get("nome_municipio") or nome
             uf_sigla = row.get("uf_sigla") or uf_hint

@@ -19,8 +19,27 @@ ALLOWED_INTENTS = {
     "tendencia",
     "media_estado",
     "pico",
+    "panorama",
     "desconhecida",
 }
+
+EXPLICIT_INTENTS = ALLOWED_INTENTS - {"panorama", "desconhecida"}
+
+_LOCATION_STOPWORDS = frozenset(
+    {"como", "qual", "quando", "onde", "quais", "quantos", "porque", "por", "que"}
+)
+
+
+VAGUE_PHRASE_KEYS = (
+    "sobre",
+    "quero saber",
+    "como esta",
+    "como está",
+    "me fale",
+    "me conte",
+    "informacoes sobre",
+    "informações sobre",
+)
 
 UF_SIGLAS = {
     "AC",
@@ -133,7 +152,49 @@ def _default_interpretation() -> dict[str, Any]:
         "metrica": "casos",
         "periodo": "anual",
         "limite": 10,
+        "gerar_grafico": False,
     }
+
+
+def wants_chart(question: str) -> bool:
+    """Pergunta pede visualização/gráfico."""
+    text = _norm(question)
+    return any(
+        k in text
+        for k in (
+            "grafico",
+            "gráfico",
+            "chart",
+            "visualiz",
+            "plotar",
+            "plote",
+            "mostre um grafico",
+            "mostre um gráfico",
+            "gerar grafico",
+            "gerar gráfico",
+            "gere um grafico",
+            "gere um gráfico",
+        )
+    )
+
+
+def wants_comparative_chart(question: str) -> bool:
+    text = _norm(question)
+    if not wants_chart(question):
+        return False
+    return any(
+        k in text
+        for k in (
+            "comparativ",
+            "comparando",
+            "compare",
+            "comparar",
+            "comparacao",
+            "versus",
+            " vs ",
+            "entre ",
+        )
+    ) or "compar" in text
 
 
 def _extract_year(question: str) -> int | None:
@@ -301,6 +362,17 @@ def _split_location_and_uf(location: str) -> tuple[str, str | None]:
     if not raw:
         return "", None
 
+    for sep in ("-", "/"):
+        if sep in raw:
+            left, right = raw.rsplit(sep, 1)
+            sigla = right.strip().upper()[:2]
+            if len(sigla) == 2 and sigla in UF_SIGLAS and re.fullmatch(
+                r"[A-Za-z]{2}", right.strip()
+            ):
+                nome = left.strip(" ,-/")
+                if nome:
+                    return nome, sigla
+
     parts = raw.split()
     if len(parts) >= 2 and parts[-1].upper() in UF_SIGLAS:
         return " ".join(parts[:-1]).strip(), parts[-1].upper()
@@ -326,6 +398,108 @@ def _split_location_and_uf(location: str) -> tuple[str, str | None]:
     return raw, None
 
 
+_TEMPORAL_SUFFIX_PATTERNS = (
+    r"\s+durante\s+o\s+ano\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+no\s+ano\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+ao\s+longo\s+do\s+ano\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+ao\s+longo\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+no\s+periodo\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+no\s+período\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+durante\s+(?:o\s+)?ano\s+(?:de\s+)?(?:19\d{2}|20\d{2})\s*$",
+    r"\s+no\s+ano\s+(?:de\s+)?(?:19\d{2}|20\d{2})\s*$",
+    r"\s+em\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+no\s+(?:19\d{2}|20\d{2})\s*$",
+    r"\s+ao\s+longo\s+de\s+(?:19\d{2}|20\d{2})\s*$",
+)
+
+_MUNICIPIO_NOISE_RE = re.compile(
+    r"\b(?:dengue|incidencia|incidência|casos|qual|foi|foram|quantos|total|"
+    r"durante|ano|anos|periodo|período|semana|semanas|epidemiologica|"
+    r"epidemiológica|ultimas|últimas|municipio|município|cidade|estado|"
+    r"regiao|região|sobre|dados|epidemia|taxa|media|média|notificados|"
+    r"confirmados|habitantes|situacao|situação|informar|gostaria|poderia)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_temporal_suffix(location: str) -> str:
+    """Remove sufixos temporais que às vezes entram no nome do município."""
+    value = str(location or "").strip(" .,:;?!")
+    if not value:
+        return value
+    changed = True
+    while changed:
+        changed = False
+        for pattern in _TEMPORAL_SUFFIX_PATTERNS:
+            new_value = re.sub(pattern, "", value, flags=re.IGNORECASE).strip(" .,:;?!")
+            if new_value != value:
+                value = new_value
+                changed = True
+    return value
+
+
+def sanitize_municipio_name(name: str) -> str:
+    """Normaliza nome de município removendo ruído temporal e epidemiológico."""
+    value = _clean_location_phrase(_strip_temporal_suffix(str(name or "").strip()))
+    if not value:
+        return ""
+    while True:
+        stripped = re.sub(
+            r"^(?:o|a|os|as|de|da|do|das|dos|em|no|na|nos|nas)\s+",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;?!")
+        if stripped == value:
+            break
+        value = stripped
+    value = re.sub(r"\b(?:19|20)\d{2}\b", "", value)
+    value = _MUNICIPIO_NOISE_RE.sub(" ", value)
+    value = re.sub(r"\s{2,}", " ", value).strip(" .,:;?!")
+    return value
+
+
+def _is_valid_municipio_candidate(name: str | None) -> bool:
+    if not name:
+        return False
+    norm = _norm(str(name))
+    if norm in _LOCATION_STOPWORDS:
+        return False
+    return not is_suspect_municipio_name(str(name))
+
+
+def is_suspect_municipio_name(name: str) -> bool:
+    """Detecta nomes de município provavelmente contaminados pelo restante da pergunta."""
+    raw = str(name or "").strip()
+    if len(raw) < 2:
+        return True
+    norm = _norm(raw)
+    if len(norm) > 45:
+        return True
+    if re.search(r"\b(?:19|20)\d{2}\b", raw):
+        return True
+    markers = (
+        "durante",
+        " incid",
+        " dengue",
+        " quantos",
+        " qual foi",
+        " ano de",
+        " no ano",
+        " periodo",
+        " período",
+        " notificad",
+        " confirmad",
+        " habitante",
+        " epidemiolog",
+        " ao longo",
+    )
+    if any(marker in norm for marker in markers):
+        return True
+    words = [w for w in norm.split() if w not in {"de", "da", "do", "em", "no", "na", "o", "a"}]
+    return len(words) > 5
+
+
 def _clean_location_phrase(location: str) -> str:
     value = str(location or "").strip(" .,:;?!")
     value = re.sub(
@@ -334,6 +508,7 @@ def _clean_location_phrase(location: str) -> str:
         value,
         flags=re.IGNORECASE,
     )
+    value = _strip_temporal_suffix(value)
     value = re.sub(r"\s{2,}", " ", value).strip(" .,:;?!")
     return value
 
@@ -349,6 +524,28 @@ def _strip_metric_prefix(phrase: str) -> str:
     return value.strip(" .,:;?!")
 
 
+def _strip_state_prefix(phrase: str) -> str:
+    """Remove prefixos como 'estado do Paraná' / 'o estado de São Paulo'."""
+    value = str(phrase or "").strip(" .,:;?!")
+    if not value:
+        return value
+    m = re.match(
+        r"^(?:o\s+|a\s+)?(?:estado|uf)\s+(?:do|da|de)\s+(.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip(" .,:;?!")
+    m = re.match(
+        r"^(?:media|média)\s+(?:do|da|de)\s+(?:estado|uf)\s+(?:do|da|de)\s+(.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip(" .,:;?!")
+    return value
+
+
 def _uf_label(uf: str) -> str:
     sigla = str(uf or "").strip().upper()[:2]
     nome = UF_TO_STATE_LABEL.get(sigla, sigla)
@@ -356,9 +553,14 @@ def _uf_label(uf: str) -> str:
 
 
 def _parse_location_entity(raw: str) -> dict[str, Any] | None:
-    cleaned = _strip_metric_prefix(_clean_location_phrase(raw))
+    cleaned = _strip_state_prefix(_strip_metric_prefix(_clean_location_phrase(raw)))
     if not cleaned:
         return None
+
+    if is_likely_state_name(cleaned):
+        uf = resolve_uf(cleaned)
+        if uf:
+            return {"tipo": "uf", "uf": uf, "nome": None, "label": _uf_label(uf)}
 
     nome, uf_hint = _split_location_and_uf(cleaned)
 
@@ -389,6 +591,8 @@ def _extract_comparison_entities(question: str) -> list[dict[str, Any]]:
         r"\b(?:compare|comparar|comparacao|comparação)\s+(.+?)\s+(?:com|com a|versus|vs\.?|e)\s+(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
         r"(?:media|média)\s+(?:do|da|de)\s+(.+?)\s+(?:com|com a|versus|vs\.?|e)\s+(?:a\s+)?(?:media|média)\s+(?:do|da|de)\s+(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
         r"\b(.+?)\s+(?:versus|vs\.?)\s+(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
+        r"\b(?:grafico|gráfico)\s+comparativ[oa]?\s+entre\s+(.+?)\s+e\s+(?:o\s+|a\s+)?(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
+        r"\bentre\s+(.+?)\s+e\s+(?:o\s+|a\s+)?(.+?)(?:\s+em\s+(?:19\d{2}|20\d{2})|\?|$|,|\.)",
     )
 
     for pattern in compare_patterns:
@@ -430,6 +634,141 @@ def _extract_compare_municipios(question: str) -> list[str]:
     return _dedupe_strs(out)
 
 
+def _location_from_phrase(phrase: str) -> tuple[str | None, str | None]:
+    location = _clean_location_phrase(phrase)
+    if not location:
+        return None, None
+    if re.fullmatch(r"\d{4}", location):
+        return None, None
+    if _norm(location) in {"a dengue", "dengue", "dengue no brasil"}:
+        return None, None
+    if location.upper() in UF_SIGLAS or _norm(location) in STATE_NAME_TO_UF:
+        uf_only = resolve_uf(location)
+        return None, uf_only
+    municipio, uf = _split_location_and_uf(location)
+    municipio = _clean_location_phrase(municipio)
+    if municipio:
+        return municipio, uf
+    if not municipio and uf:
+        return None, uf
+    return None, None
+
+
+def _looks_like_analytical_question(question: str) -> bool:
+    text = _norm(question)
+    markers = (
+        "esta acima",
+        "está acima",
+        "esta abaixo",
+        "está abaixo",
+        "media do",
+        "média do",
+        "compare",
+        "comparar",
+        "versus",
+        "quantos",
+        "incidencia",
+        "incidência",
+        "ranking",
+        "tendencia",
+        "tendência",
+        "pico",
+    )
+    return any(m in text for m in markers)
+
+
+def _extract_bare_location(question: str) -> tuple[str | None, str | None]:
+    """
+    Extrai localidade de frases curtas ou vagas (ex.: 'palmas tocantins', 'Serra Talhada').
+    """
+    text = str(question or "").strip()
+    if not text or _looks_like_analytical_question(text):
+        return None, None
+
+    vague_patterns = (
+        r"\b(?:quero saber|gostaria de saber|me fale|me conte)(?:\s+sobre)?\s+(.+?)(?:\?|$)",
+        r"\bsobre\s+(.+?)(?:\?|$)",
+        r"\bcomo\s+esta\s+(?:a\s+)?(?:dengue\s+)?(?:em|no|na)\s+(.+?)(?:\?|$)",
+        r"\bcomo\s+está\s+(?:a\s+)?(?:dengue\s+)?(?:em|no|na)\s+(.+?)(?:\?|$)",
+    )
+    for pattern in vague_patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            municipio, uf = _location_from_phrase(m.group(1))
+            if municipio or uf:
+                return municipio, uf
+
+    stripped = re.sub(
+        r"^(?:quero saber|gostaria de saber|me fale|me conte|informacoes sobre|informações sobre)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;?!")
+    stripped = re.sub(r"^(?:sobre|de|da|do)\s+", "", stripped, flags=re.IGNORECASE).strip(" .,:;?!")
+    if stripped and len(stripped) <= 80:
+        municipio, uf = _location_from_phrase(stripped)
+        if municipio or uf:
+            return municipio, uf
+
+    return None, None
+
+
+def _extract_location_from_elaborate_phrase(question: str) -> tuple[str | None, str | None]:
+    """Padrões para perguntas longas (banca, formulários elaborados)."""
+    text = str(question or "").strip()
+    if not text:
+        return None, None
+
+    patterns = (
+        r"\b(?:na|cidade|municipio|município)\s+(?:de|do|da)\s+(.+?)(?:\s+(?:durante|no\s+ano|ao\s+longo|em\s+(?:19|20)\d{2})|\?|$)",
+        r"\b(?:para|em)\s+(?:o\s+|a\s+)?(?:municipio|município|cidade)\s+(?:de|do|da)\s+(.+?)(?:\?|$)",
+        r"\b(?:dados|casos|incidencia|incidência|situacao|situação|taxa)\s+(?:de|da|do)?\s*dengue\s+(?:em|no|na)\s+(.+?)(?:\s+(?:durante|no\s+ano)|\?|$)",
+        r"\b(?:notificados|confirmados|registrados)\s+(?:em|no|na)\s+(.+?)(?:\s+(?:no\s+ano|em\s+(?:19|20)\d{2})|\?|$)",
+        r"\b(?:quantos|qual)\s+.+?\s+(?:em|no|na)\s+(.+?)(?:\s+(?:durante|no\s+ano|ao\s+longo)|\?|$)",
+        r"\b(?:em|no|na)\s+(.+?)\s+[-/]\s*([A-Za-z]{2})\b",
+    )
+
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        chunk = m.group(1)
+        municipio, uf = _location_from_phrase(chunk)
+        if m.lastindex and m.lastindex >= 2:
+            sigla = str(m.group(2) or "").strip().upper()[:2]
+            if sigla in UF_SIGLAS:
+                uf = uf or sigla
+        if municipio or uf:
+            return municipio, uf
+    return None, None
+
+
+def _extract_all_location_hints(question: str) -> tuple[str | None, str | None]:
+    """Tenta várias heurísticas até obter localidade plausível."""
+    text = str(question or "").strip()
+    extractors = (
+        _extract_location_from_elaborate_phrase,
+        _extract_primary_location,
+    )
+    for extractor in extractors:
+        municipio, uf = extractor(text)
+        if municipio:
+            municipio = sanitize_municipio_name(municipio)
+        if municipio and not is_suspect_municipio_name(municipio):
+            return municipio, uf
+        if uf and not municipio:
+            return None, uf
+
+    bare_mun, bare_uf = _extract_bare_location(text)
+    if bare_mun:
+        bare_mun = sanitize_municipio_name(bare_mun)
+    if bare_mun and not is_suspect_municipio_name(bare_mun):
+        return bare_mun, bare_uf
+    if bare_uf:
+        return None, bare_uf
+    return None, None
+
+
 def _extract_primary_location(question: str) -> tuple[str | None, str | None]:
     text = str(question or "").strip()
 
@@ -437,6 +776,9 @@ def _extract_primary_location(question: str) -> tuple[str | None, str | None]:
         r"^\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\- ]{1,60}?)\s+esta\b",
         r"^\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\- ]{1,60}?)\s+está\b",
         r"\b(?:em|no|na)\s+(.+?)\s+em\s+(?:19\d{2}|20\d{2})\b",
+        r"\b(?:em|no|na)\s+(.+?)\s+(?:durante\s+)?(?:o\s+)?ano\s+(?:de\s+)?(?:19\d{2}|20\d{2})\b",
+        r"\b(?:em|no|na)\s+(.+?)\s+durante\s+(?:19\d{2}|20\d{2})\b",
+        r"\b(?:em|no|na)\s+(.+?)\s+ao\s+longo\s+(?:de\s+)?(?:19\d{2}|20\d{2})\b",
         r"\b(?:em|no|na)\s+(.+?)(?:\s+nas?\s+ultimas?\s+semanas|\s+nas?\s+últimas?\s+semanas|\?|$)",
     ]
 
@@ -444,19 +786,19 @@ def _extract_primary_location(question: str) -> tuple[str | None, str | None]:
         m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             continue
-        location = _clean_location_phrase(m.group(1))
-        if not location:
-            continue
-        if re.fullmatch(r"\d{4}", location):
-            continue
-        if _norm(location) in {"a dengue", "dengue"}:
-            continue
-        if location.upper() in UF_SIGLAS or _norm(location) in STATE_NAME_TO_UF:
-            continue
-        municipio, uf = _split_location_and_uf(location)
-        municipio = _clean_location_phrase(municipio)
-        if municipio:
+        municipio, uf = _location_from_phrase(m.group(1))
+        if municipio and not _is_valid_municipio_candidate(municipio):
+            municipio = None
+        if municipio or uf:
             return municipio, uf
+
+    elaborate_mun, elaborate_uf = _extract_location_from_elaborate_phrase(text)
+    if elaborate_mun or elaborate_uf:
+        return elaborate_mun, elaborate_uf
+
+    bare_mun, bare_uf = _extract_bare_location(text)
+    if bare_mun or bare_uf:
+        return bare_mun, bare_uf
     return None, None
 
 
@@ -465,6 +807,12 @@ def _is_comparison_question(question: str) -> bool:
     if re.search(r"\b(?:compare|comparar|comparacao|comparacao|versus|vs\.?)\b", text):
         return True
     if re.search(r"(?:media|média).*\b(?:com|com a|versus|vs\.?| e )\b", question, flags=re.IGNORECASE):
+        return True
+    if wants_comparative_chart(question):
+        return True
+    if wants_chart(question) and re.search(
+        r"\b(?:entre|com|e|versus|vs\.?)\b", text
+    ):
         return True
     return False
 
@@ -488,7 +836,29 @@ def _detect_intent(question: str) -> str:
         return "incidencia"
     if any(key in text for key in ["quantos casos", "total de casos", "casos de dengue", "quantos"]):
         return "total"
+    if any(key in text for key in VAGUE_PHRASE_KEYS):
+        return "desconhecida"
     return "desconhecida"
+
+
+def has_location_hint(interpretacao: dict[str, Any]) -> bool:
+    return bool(interpretacao.get("municipios") or interpretacao.get("ufs"))
+
+
+def infer_intent_when_vague(interpretacao: dict[str, Any], pergunta: str = "") -> dict[str, Any]:
+    """
+    Se há localidade mas intenção indefinida, assume panorama (resumo epidemiológico).
+    """
+    data = dict(interpretacao or {})
+    intent = str(data.get("intencao") or "desconhecida")
+    if intent in EXPLICIT_INTENTS:
+        return data
+    if not has_location_hint(data):
+        return data
+    data["intencao"] = "panorama"
+    if not data.get("metrica"):
+        data["metrica"] = "casos"
+    return data
 
 
 def _detect_metric(question: str, intent: str) -> str:
@@ -528,7 +898,10 @@ def _normalize_interpretation(raw: dict[str, Any] | None) -> dict[str, Any]:
     municipios = data.get("municipios") or []
     if isinstance(municipios, str):
         municipios = [municipios]
-    data["municipios"] = _dedupe_strs([str(m).strip() for m in municipios if str(m).strip()])
+    data["municipios"] = _dedupe_strs(
+        [sanitize_municipio_name(str(m)) for m in municipios if str(m).strip()]
+    )
+    data["municipios"] = [m for m in data["municipios"] if m]
 
     ufs = data.get("ufs") or []
     if isinstance(ufs, str):
@@ -555,6 +928,8 @@ def _normalize_interpretation(raw: dict[str, Any] | None) -> dict[str, Any]:
     period = str(data.get("periodo") or "anual").strip().lower()
     data["periodo"] = "semanal" if period.startswith("seman") else "anual"
 
+    data["gerar_grafico"] = bool(data.get("gerar_grafico"))
+
     if data["semana"] is not None and not (1 <= int(data["semana"]) <= 53):
         data["semana"] = None
 
@@ -577,7 +952,11 @@ def _normalize_interpretation(raw: dict[str, Any] | None) -> dict[str, Any]:
             entity["nome"] = None
             entity["label"] = str(raw_entity.get("label") or _uf_label(uf))
         else:
-            nome = str(raw_entity.get("nome") or raw_entity.get("municipio") or "").strip()
+            nome = _clean_location_phrase(
+                _strip_temporal_suffix(
+                    str(raw_entity.get("nome") or raw_entity.get("municipio") or "").strip()
+                )
+            )
             if len(nome) < 2:
                 continue
             uf_hint = resolve_uf(str(raw_entity.get("uf") or "")) if raw_entity.get("uf") else None
@@ -600,6 +979,60 @@ def _normalize_interpretation(raw: dict[str, Any] | None) -> dict[str, Any]:
     data["ufs"] = normalize_ufs([str(u) for u in ufs if str(u).strip()])
 
     return data
+
+
+def repair_interpretation(question: str, data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Corrige interpretações com município contaminado ou ausente (perguntas longas).
+    """
+    out = relocate_state_names(dict(data or {}))
+    pergunta = str(question or "").strip()
+
+    municipios = [
+        sanitize_municipio_name(str(m))
+        for m in list(out.get("municipios") or [])
+        if str(m).strip()
+    ]
+    municipios = [m for m in municipios if m and not is_likely_state_name(m)]
+    ufs = list(out.get("ufs") or [])
+
+    needs_repair = not municipios or any(
+        is_suspect_municipio_name(str(m)) for m in list(out.get("municipios") or [])
+    )
+
+    if needs_repair:
+        mun, uf = _extract_all_location_hints(pergunta)
+        if mun:
+            municipios = _dedupe_strs([mun])
+        if uf:
+            ufs.append(uf)
+
+    if out.get("intencao") == "comparacao":
+        entidades = list(out.get("entidades") or [])
+        repaired_entities: list[dict[str, Any]] = []
+        for entity in entidades:
+            if not isinstance(entity, dict):
+                continue
+            entity = dict(entity)
+            if entity.get("tipo") == "municipio" and entity.get("nome"):
+                nome = sanitize_municipio_name(str(entity["nome"]))
+                if is_suspect_municipio_name(nome):
+                    continue
+                entity["nome"] = nome
+                entity["label"] = str(entity.get("label") or nome)
+            repaired_entities.append(entity)
+        if len(repaired_entities) < 2 and _is_comparison_question(pergunta):
+            repaired_entities = _extract_comparison_entities(pergunta)
+        out["entidades"] = repaired_entities
+
+    if not out.get("ano"):
+        ano = _extract_year(pergunta)
+        if ano is not None:
+            out["ano"] = ano
+
+    out["municipios"] = _dedupe_strs(municipios)
+    out["ufs"] = _dedupe_strs(ufs)
+    return _normalize_interpretation(out)
 
 
 def _build_rule_based_interpretation(question: str) -> dict[str, Any]:
@@ -634,6 +1067,10 @@ def _build_rule_based_interpretation(question: str) -> dict[str, Any]:
     if out["intencao"] == "desconhecida" and "incid" in _norm(question):
         out["intencao"] = "incidencia"
         out["metrica"] = "incidencia"
+
+    out["gerar_grafico"] = wants_comparative_chart(question) or (
+        wants_chart(question) and out["intencao"] == "comparacao"
+    )
 
     return _normalize_interpretation(out)
 
@@ -671,7 +1108,16 @@ def count_valid_entities(parsed: dict[str, Any]) -> int:
     return len(municipios) + len(ufs)
 
 
+def _is_vague_question(question: str) -> bool:
+    text = _norm(question)
+    if any(key in text for key in VAGUE_PHRASE_KEYS):
+        return True
+    tokens = [t for t in re.findall(r"[a-zà-ÿ]{2,}", text) if t not in {"de", "da", "do", "em", "no", "na", "a", "o"}]
+    return len(tokens) <= 6
+
+
 def _should_try_llm(parsed: dict[str, Any]) -> bool:
+    pergunta = str(parsed.get("_pergunta_original") or "")
     if parsed["intencao"] == "desconhecida":
         return True
     if parsed["intencao"] == "comparacao" and count_valid_entities(parsed) < 2:
@@ -680,7 +1126,13 @@ def _should_try_llm(parsed: dict[str, Any]) -> bool:
         return True
     if parsed["intencao"] in {"incidencia", "total", "tendencia", "pico"} and not parsed["municipios"] and not parsed["ufs"]:
         return True
-    if _is_comparison_question(str(parsed.get("_pergunta_original") or "")) and count_valid_entities(parsed) < 2:
+    if _is_comparison_question(pergunta) and count_valid_entities(parsed) < 2:
+        return True
+    if _is_vague_question(pergunta) and not has_location_hint(parsed):
+        return True
+    if parsed["intencao"] == "desconhecida" and _is_vague_question(pergunta):
+        return True
+    if any(is_suspect_municipio_name(str(m)) for m in parsed.get("municipios") or []):
         return True
     return False
 
@@ -696,7 +1148,10 @@ def _try_llm_interpretation(question: str) -> dict[str, Any] | None:
         "Você interpreta perguntas epidemiológicas sobre dengue no Brasil. "
         "Retorne somente JSON válido, sem markdown e sem texto extra. "
         "Campos obrigatórios: intencao, municipios, ufs, entidades, ano, semana, metrica, periodo, limite. "
-        "Intenções válidas: incidencia, total, ranking, comparacao, tendencia, media_estado, pico, desconhecida. "
+        "Intenções válidas: incidencia, total, ranking, comparacao, tendencia, media_estado, pico, panorama, desconhecida. "
+        "Use panorama quando a pergunta for vaga mas houver município ou UF (ex.: 'quero saber sobre X', 'palmas tocantins'). "
+        "Nunca use desconhecida se municipios ou ufs estiverem preenchidos — use panorama. "
+        "Use gerar_grafico=true quando o usuário pedir gráfico comparativo ou visualização comparando localidades. "
         "Use entidades para comparações mistas entre UF e município. "
         "Cada entidade deve ter: tipo (uf|municipio), uf, nome, label."
     )
@@ -712,10 +1167,23 @@ def _try_llm_interpretation(question: str) -> dict[str, Any] | None:
         '3) "Palmas está acima da média do Tocantins em 2025" -> '
         '{"intencao":"media_estado","municipios":["Palmas"],"ufs":["TO"],"ano":2025,"metrica":"incidencia"}\n'
         '4) "qual a incidencia em araguaina" -> '
-        '{"intencao":"incidencia","municipios":["Araguaína"],"metrica":"incidencia"}\n\n'
+        '{"intencao":"incidencia","municipios":["Araguaína"],"metrica":"incidencia"}\n'
+        '5) "Quero saber sobre Serra Talhada" -> '
+        '{"intencao":"panorama","municipios":["Serra Talhada"],"metrica":"casos"}\n'
+        '6) "palmas tocantins" -> '
+        '{"intencao":"panorama","municipios":["Palmas"],"ufs":["TO"],"metrica":"casos"}\n'
+        '7) "como está a dengue em Araguaína" -> '
+        '{"intencao":"panorama","municipios":["Araguaína"],"metrica":"casos"}\n'
+        '8) "gere um gráfico comparativo entre Palmas TO e o Paraná em 2025" -> '
+        '{"intencao":"comparacao","gerar_grafico":true,"entidades":[{"tipo":"municipio","nome":"Palmas","uf":"TO","label":"Palmas/TO"},'
+        '{"tipo":"uf","uf":"PR","nome":null,"label":"Parana (UF)"}],"ano":2025,"metrica":"casos"}\n'
+        '9) "qual foi a incidencia da dengue em palmas durante o ano de 2025" -> '
+        '{"intencao":"incidencia","municipios":["Palmas"],"ufs":["TO"],"ano":2025,"metrica":"incidencia"}\n'
+        'Nunca inclua ano, "durante", "dengue" ou "incidencia" dentro de municipios.\n\n'
         "Retorne JSON no formato:\n"
         "{\n"
-        '  "intencao": "incidencia | total | ranking | comparacao | tendencia | media_estado | pico | desconhecida",\n'
+        '  "intencao": "incidencia | total | ranking | comparacao | tendencia | media_estado | pico | panorama | desconhecida",\n'
+        '  "gerar_grafico": false,\n'
         '  "municipios": ["Palmas"],\n'
         '  "ufs": ["TO"],\n'
         '  "entidades": [{"tipo":"uf","uf":"PR","nome":null,"label":"Parana (UF)"}],\n'
@@ -774,6 +1242,6 @@ def interpret_question(pergunta: str) -> dict[str, Any]:
                 )
             )
             merged.pop("_pergunta_original", None)
-            return merged
+            return repair_interpretation(pergunta, infer_intent_when_vague(merged, pergunta))
     base.pop("_pergunta_original", None)
-    return base
+    return repair_interpretation(pergunta, infer_intent_when_vague(base, pergunta))

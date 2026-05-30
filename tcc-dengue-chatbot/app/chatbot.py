@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 from sqlalchemy import text
 
-from app import llm, nlu, queries
+from app import charts, llm, nlu, queries
 from app.db import get_engine
 from app.rag import retrieve_context
 
@@ -114,7 +114,9 @@ def _ambiguity_message(term: str, df: pd.DataFrame) -> str:
     linhas = [f"Encontrei mais de um município relacionado a '{term}'. Você quis dizer:"]
     for i, row in enumerate(df.itertuples(index=False), start=1):
         linhas.append(f"{i}. {row.nome_municipio}/{row.uf_sigla}")
-    linhas.append("Responda com o município e a UF para eu calcular corretamente.")
+    linhas.append(
+        "Responda com o município e a UF (ex.: Serra Talhada/PE) para eu calcular corretamente."
+    )
     return "\n".join(linhas)
 
 
@@ -122,7 +124,7 @@ def _resolve_single_municipio(
     termo: str,
     uf_hint: str | None = None,
 ) -> dict[str, Any]:
-    nome = str(termo or "").strip()
+    nome = nlu._clean_location_phrase(nlu._strip_temporal_suffix(str(termo or "").strip()))
     if not nome:
         return {"nome": None, "uf": uf_hint, "nota": None, "resposta": None}
 
@@ -189,11 +191,71 @@ def _resolve_single_municipio(
     return {"nome": None, "uf": uf_hint, "nota": None, "resposta": _ambiguity_message(nome, df.head(10))}
 
 
+def _uf_hint_for_index(interpretacao: dict[str, Any], index: int) -> str | None:
+    ufs = [_normalize_uf(u) for u in list(interpretacao.get("ufs") or []) if _normalize_uf(u)]
+    if not ufs:
+        return None
+    if index < len(ufs):
+        return ufs[index]
+    if len(ufs) == 1:
+        return ufs[0]
+    return None
+
+
+def _fetch_indicador_resilient(
+    *,
+    municipio: str | None,
+    uf: str | None,
+    ano: int | None,
+) -> tuple[pd.DataFrame, str | None]:
+    """Busca indicador com fallbacks (UF, resolução de nome, ano mais recente)."""
+    if not municipio and not uf:
+        return pd.DataFrame(), None
+
+    extra_note: str | None = None
+    df = queries.get_indicador_municipio(municipio=municipio, uf=uf, ano=ano)
+    if not df.empty:
+        return df, None
+
+    if municipio and uf:
+        df = queries.get_indicador_municipio(municipio=municipio, uf=None, ano=ano)
+        if not df.empty and "uf_sigla" in df.columns:
+            scoped = df[df["uf_sigla"].astype(str).str.upper() == str(uf).upper()]
+            if not scoped.empty:
+                return scoped, None
+
+    if municipio:
+        resolved = _resolve_single_municipio(str(municipio), uf_hint=uf)
+        if resolved.get("nome"):
+            res_name = str(resolved["nome"])
+            res_uf = _normalize_uf(resolved.get("uf")) or uf
+            if res_name.lower() != str(municipio).lower() or res_uf != uf:
+                df = queries.get_indicador_municipio(
+                    municipio=res_name, uf=res_uf, ano=ano
+                )
+                if not df.empty:
+                    return df, resolved.get("nota")
+
+    if municipio and ano is not None:
+        df_years = queries.get_indicador_municipio(municipio=municipio, uf=uf, ano=None)
+        if not df_years.empty and "ano" in df_years.columns:
+            anos = pd.to_numeric(df_years["ano"], errors="coerce").dropna()
+            if not anos.empty:
+                alt_ano = int(anos.max())
+                subset = df_years[df_years["ano"] == alt_ano]
+                if not subset.empty:
+                    extra_note = (
+                        f"Não há dados para {ano} na base; usei o ano mais recente disponível ({alt_ano})."
+                    )
+                    return subset, extra_note
+
+    return pd.DataFrame(), extra_note
+
+
 def _resolve_municipios(
     interpretacao: dict[str, Any],
 ) -> tuple[list[str], list[str], list[str], str | None]:
     requested = _dedupe_strs(list(interpretacao.get("municipios") or []))
-    uf_hint = _normalize_uf((interpretacao.get("ufs") or [None])[0])
 
     if not requested:
         return [], _dedupe_strs(list(interpretacao.get("ufs") or [])), [], None
@@ -202,7 +264,8 @@ def _resolve_municipios(
     resolved_ufs: list[str] = []
     notes: list[str] = []
 
-    for termo in requested:
+    for index, termo in enumerate(requested):
+        uf_hint = _uf_hint_for_index(interpretacao, index)
         result = _resolve_single_municipio(termo, uf_hint=uf_hint)
         if result["resposta"]:
             return [], [], notes, str(result["resposta"])
@@ -247,6 +310,19 @@ def _resolve_entidades(
         if not nome:
             continue
 
+        if nlu.is_likely_state_name(nome):
+            uf_state = _normalize_uf(nlu.resolve_uf(nome))
+            if uf_state:
+                resolved.append(
+                    {
+                        "tipo": "uf",
+                        "uf": uf_state,
+                        "nome": None,
+                        "label": str(entidade.get("label") or f"{uf_state} (UF)"),
+                    }
+                )
+                continue
+
         result = _resolve_single_municipio(nome, uf_hint=uf_hint)
         if result["resposta"]:
             return [], notes, str(result["resposta"])
@@ -281,10 +357,49 @@ def _apply_default_year(interpretacao: dict[str, Any]) -> tuple[dict[str, Any], 
     return data, int(ano)
 
 
-def _is_municipio_only_comparison(entidades: list[dict[str, Any]]) -> bool:
-    if len(entidades) != 2:
-        return False
-    return all(str(item.get("tipo") or "") == "municipio" for item in entidades)
+def _comparison_scope_uf(interpretacao: dict[str, Any]) -> str | None:
+    """
+    UF global só quando há uma única UF na comparação.
+    Comparações entre estados ou municípios de UFs diferentes não devem filtrar por uma UF só.
+    """
+    intent = str(interpretacao.get("intencao") or "")
+    if intent != "comparacao":
+        ufs = list(interpretacao.get("ufs") or [])
+        return _normalize_uf(ufs[0]) if ufs else None
+
+    entidades = list(interpretacao.get("entidades") or [])
+    if entidades:
+        scoped: list[str] = []
+        for item in entidades:
+            tipo = str(item.get("tipo") or "").strip().lower()
+            if tipo == "uf":
+                uf = _normalize_uf(item.get("uf"))
+                if uf:
+                    scoped.append(uf)
+            elif tipo == "municipio":
+                uf = _normalize_uf(item.get("uf"))
+                if uf:
+                    scoped.append(uf)
+        unique = _dedupe_strs(scoped)
+        if len(unique) == 1:
+            return unique[0]
+        return None
+
+    municipios = list(interpretacao.get("municipios") or [])
+    ufs = [_normalize_uf(u) for u in list(interpretacao.get("ufs") or []) if _normalize_uf(u)]
+    unique = _dedupe_strs(ufs)
+    if len(municipios) >= 2:
+        return unique[0] if len(unique) == 1 else None
+    return unique[0] if unique else None
+
+
+def _municipios_uf_hints(entidades: list[dict[str, Any]]) -> list[str | None] | None:
+    if not entidades or not all(str(item.get("tipo") or "") == "municipio" for item in entidades):
+        return None
+    hints = [_normalize_uf(item.get("uf")) for item in entidades]
+    if not any(hints):
+        return None
+    return hints
 
 
 def _need_more_filters_message(interp: dict[str, Any]) -> str | None:
@@ -308,7 +423,106 @@ def _need_more_filters_message(interp: dict[str, Any]) -> str | None:
         return "Informe o município para localizar o pico epidemiológico."
     if intent == "total" and not (municipios or ufs or ano):
         return "Informe pelo menos município, UF ou ano para calcular o total."
+    if intent == "panorama" and not (municipios or ufs):
+        return "Informe o município ou o estado para montar o panorama epidemiológico."
     return None
+
+
+def _unknown_intent_message(interpretacao: dict[str, Any]) -> str:
+    municipios = list(interpretacao.get("municipios") or [])
+    ufs = list(interpretacao.get("ufs") or [])
+    if municipios or ufs:
+        local = municipios[0] if municipios else ufs[0]
+        uf_hint = f"/{ufs[0]}" if municipios and ufs else ""
+        return (
+            f"Identifiquei a localidade ({local}{uf_hint}), mas não entendi o tipo de análise. "
+            "Tente, por exemplo:\n"
+            f"- Quantos casos de dengue houve em {local}{uf_hint}?\n"
+            f"- Qual a incidência em {local}{uf_hint}?\n"
+            f"- Como está a tendência em {local}{uf_hint} nas últimas semanas?"
+        )
+    return (
+        "Não identifiquei localidade nem tipo de análise. Exemplos:\n"
+        "- Quero saber sobre Serra Talhada\n"
+        "- Qual a incidência de dengue em Palmas TO?\n"
+        "- Quais municípios do TO tiveram mais casos em 2025?"
+    )
+
+
+def _panorama_has_data(dados_calculados: dict[str, Any]) -> bool:
+    for key in ("indicador", "comparacao_estadual", "indicador_uf", "ranking_uf"):
+        block = dados_calculados.get(key)
+        if isinstance(block, pd.DataFrame) and not block.empty:
+            return True
+        if isinstance(block, list) and block:
+            return True
+    tendencia = dados_calculados.get("tendencia") or {}
+    if isinstance(tendencia, dict):
+        serie = tendencia.get("serie")
+        if isinstance(serie, pd.DataFrame) and not serie.empty:
+            return True
+        resumo = tendencia.get("resumo") or {}
+        if resumo.get("casos_ultimas_n") is not None:
+            return True
+    return False
+
+
+def _execute_panorama(
+    *,
+    municipio: str | None,
+    uf: str | None,
+    ano: int | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Monta payload de panorama municipal ou estadual."""
+    dados_calculados: dict[str, Any] = {
+        "tipo_consulta": "panorama",
+        "local_resolvida": {"municipio": municipio, "uf": uf, "ano": ano},
+    }
+    dados_ui = pd.DataFrame()
+
+    if municipio:
+        indicador = queries.get_indicador_municipio(municipio=municipio, uf=uf, ano=ano)
+        trend = queries.get_tendencia_municipio(municipio=municipio, uf=uf, ano=ano, ultimas_n=6)
+        comparacao = queries.comparar_municipio_com_estado(municipio=municipio, uf=uf, ano=ano)
+        dados_calculados["indicador"] = indicador
+        dados_calculados["tendencia"] = {
+            "serie": trend.get("serie", pd.DataFrame()),
+            "resumo": trend.get("resumo", {}),
+        }
+        dados_calculados["comparacao_estadual"] = comparacao
+        serie = trend.get("serie", pd.DataFrame())
+        dados_ui = serie if isinstance(serie, pd.DataFrame) and not serie.empty else indicador
+    elif uf:
+        indicador_uf = queries.get_indicador_municipio(uf=uf, ano=ano)
+        ranking = queries.get_ranking(uf=uf, ano=ano, metrica="casos", limit=5)
+        dados_calculados["indicador_uf"] = indicador_uf
+        dados_calculados["ranking_uf"] = ranking
+        dados_ui = ranking if isinstance(ranking, pd.DataFrame) and not ranking.empty else indicador_uf
+    else:
+        dados_calculados["erro"] = "Localidade não informada para panorama."
+
+    return dados_ui, dados_calculados
+
+
+def _empty_data_message(
+    interpretacao: dict[str, Any],
+    *,
+    municipio: str | None,
+    uf: str | None,
+    ano: int | None,
+    notes: list[str],
+) -> str:
+    parts = []
+    if municipio:
+        parts.append(f"município {municipio}" + (f"/{uf}" if uf else ""))
+    elif uf:
+        parts.append(f"UF {uf}")
+    local = ", ".join(parts) if parts else "local informado"
+    ano_txt = f" no ano {ano}" if ano else ""
+    msg = f"Não encontrei registros de dengue para {local}{ano_txt} na base carregada."
+    if notes:
+        return "\n\n".join(notes + [msg])
+    return msg
 
 
 def _build_rag_filters(interp: dict[str, Any]) -> dict[str, Any]:
@@ -357,6 +571,53 @@ def _compact_dados_para_llm(
 
     out["resultado"] = result
     return out
+
+
+def _df_to_records(df: Any) -> list[dict[str, Any]]:
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df.head(MAX_REGISTROS_LLM).to_dict(orient="records")
+    return []
+
+
+def _compact_panorama_para_llm(dados_calculados: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "tipo_consulta": "panorama",
+        "local_resolvida": dados_calculados.get("local_resolvida"),
+    }
+    if dados_calculados.get("ano_assumido") is not None:
+        out["ano_assumido"] = dados_calculados["ano_assumido"]
+    if dados_calculados.get("filtros"):
+        out["filtros"] = dados_calculados["filtros"]
+
+    for key in ("indicador", "comparacao_estadual", "indicador_uf", "ranking_uf"):
+        block = dados_calculados.get(key)
+        if isinstance(block, pd.DataFrame):
+            out[key] = _df_to_records(block)
+
+    tendencia = dados_calculados.get("tendencia")
+    if isinstance(tendencia, dict):
+        serie = tendencia.get("serie")
+        out["tendencia"] = {
+            "serie": _df_to_records(serie),
+            "resumo": tendencia.get("resumo") or {},
+        }
+
+    if dados_calculados.get("erro_query"):
+        out["erro_query"] = dados_calculados["erro_query"]
+    return out
+
+
+def _should_show_comparacao_chart(
+    interpretacao: dict[str, Any],
+    pergunta: str,
+    dados_ui: pd.DataFrame,
+    intent: str,
+) -> bool:
+    if intent != "comparacao":
+        return False
+    if not charts.comparacao_chartable(dados_ui):
+        return bool(interpretacao.get("gerar_grafico") or charts.wants_comparative_chart(pergunta, interpretacao))
+    return True
 
 
 def _empty_result(
@@ -432,6 +693,7 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
         notes.extend(mun_notes)
 
     interpretacao, ano_assumido = _apply_default_year(interpretacao)
+    interpretacao = nlu.infer_intent_when_vague(interpretacao, pergunta)
     if notes:
         interpretacao["observacoes"] = _dedupe_strs(notes)
 
@@ -445,7 +707,7 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
     ufs = list(interpretacao.get("ufs") or [])
     entidades = list(interpretacao.get("entidades") or [])
     municipio = municipios[0] if municipios else None
-    uf = _normalize_uf(ufs[0]) if ufs else None
+    uf = _comparison_scope_uf(interpretacao)
     ano = interpretacao.get("ano")
     semana = interpretacao.get("semana")
     metrica = str(interpretacao.get("metrica") or "casos")
@@ -453,7 +715,7 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
 
     if intent == "desconhecida":
         return _empty_result(
-            "Não consegui identificar o tipo de análise desejada. Tente perguntar sobre incidência, total de casos, ranking, comparação, tendência, média estadual ou pico epidemiológico.",
+            _unknown_intent_message(interpretacao),
             interpretacao=interpretacao,
             filtros_ui=filtros_ui,
         )
@@ -484,36 +746,84 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
 
     try:
         if intent in {"incidencia", "total"}:
-            df = queries.get_indicador_municipio(municipio=municipio, uf=uf, ano=ano)
+            df, fetch_note = _fetch_indicador_resilient(municipio=municipio, uf=uf, ano=ano)
+            if fetch_note:
+                notes.append(fetch_note)
             dados_ui = df
         elif intent == "ranking":
             df = queries.get_ranking(uf=uf, ano=ano, metrica=metrica, limit=limite)
             dados_ui = df
         elif intent == "comparacao" and len(entidades) >= 2:
-            if _is_municipio_only_comparison(entidades):
+            df = queries.comparar_entidades(entidades=entidades, ano=ano, metrica=metrica)
+            if isinstance(df, pd.DataFrame) and df.empty:
+                mun_hints = _municipios_uf_hints(entidades)
                 df = queries.comparar_municipios(
-                    municipios=[str(item["nome"]) for item in entidades],
+                    municipios=[str(item["nome"]) for item in entidades if item.get("nome")],
                     uf=uf,
                     ano=ano,
                     metrica=metrica,
+                    municipios_uf=mun_hints,
                 )
-            else:
-                df = queries.comparar_entidades(entidades=entidades, ano=ano, metrica=metrica)
-            dados_ui = df
+            dados_ui = charts.prepare_comparacao_df(df)
             dados_calculados["entidades_comparadas"] = entidades
         elif intent == "comparacao":
             df = queries.comparar_municipios(municipios=municipios, uf=uf, ano=ano, metrica=metrica)
-            dados_ui = df
+            dados_ui = charts.prepare_comparacao_df(df)
         elif intent == "tendencia":
             trend = queries.get_tendencia_municipio(municipio=municipio, uf=uf, ano=ano, ultimas_n=6)
+            serie = trend.get("serie", pd.DataFrame())
+            if isinstance(serie, pd.DataFrame) and serie.empty and municipio:
+                resolved = _resolve_single_municipio(str(municipio), uf_hint=uf)
+                if resolved.get("nome"):
+                    trend = queries.get_tendencia_municipio(
+                        municipio=resolved["nome"],
+                        uf=_normalize_uf(resolved.get("uf")) or uf,
+                        ano=ano,
+                        ultimas_n=6,
+                    )
+                    if resolved.get("nota"):
+                        notes.append(str(resolved["nota"]))
             dados_ui = trend.get("serie", pd.DataFrame())
             dados_calculados["resumo"] = trend.get("resumo", {})
         elif intent == "media_estado":
             df = queries.comparar_municipio_com_estado(municipio=municipio, uf=uf, ano=ano)
+            if isinstance(df, pd.DataFrame) and df.empty and municipio:
+                resolved = _resolve_single_municipio(str(municipio), uf_hint=uf)
+                res_uf = _normalize_uf(resolved.get("uf")) or uf
+                if resolved.get("nome") and res_uf:
+                    df = queries.comparar_municipio_com_estado(
+                        municipio=resolved["nome"], uf=res_uf, ano=ano
+                    )
+                    if resolved.get("nota"):
+                        notes.append(str(resolved["nota"]))
             dados_ui = df
         elif intent == "pico":
             df = queries.get_pico_epidemiologico(municipio=municipio, uf=uf, ano=ano)
+            if isinstance(df, pd.DataFrame) and df.empty and municipio:
+                resolved = _resolve_single_municipio(str(municipio), uf_hint=uf)
+                if resolved.get("nome"):
+                    df = queries.get_pico_epidemiologico(
+                        municipio=resolved["nome"],
+                        uf=_normalize_uf(resolved.get("uf")) or uf,
+                        ano=ano,
+                    )
+                    if resolved.get("nota"):
+                        notes.append(str(resolved["nota"]))
             dados_ui = df
+        elif intent == "panorama":
+            dados_ui, dados_calculados = _execute_panorama(
+                municipio=municipio,
+                uf=uf,
+                ano=ano,
+            )
+            dados_calculados["filtros"] = {
+                "municipios": municipios,
+                "ufs": ufs,
+                "ano": ano,
+                "metrica": metrica,
+            }
+            if ano_assumido is not None:
+                dados_calculados["ano_assumido"] = ano_assumido
         else:
             dados_ui = pd.DataFrame()
     except Exception as exc:
@@ -526,10 +836,18 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
         dados_calculados.get("erro_query"),
     )
 
-    if isinstance(dados_ui, pd.DataFrame) and dados_ui.empty and not dados_calculados.get("erro_query"):
-        resposta = "Não encontrei dados para essa combinação de filtros."
-        if notes:
-            resposta = "\n\n".join(notes + [resposta])
+    panorama_sem_dados = intent == "panorama" and not _panorama_has_data(dados_calculados)
+    if (
+        (isinstance(dados_ui, pd.DataFrame) and dados_ui.empty and not dados_calculados.get("erro_query"))
+        or panorama_sem_dados
+    ):
+        resposta = _empty_data_message(
+            interpretacao,
+            municipio=municipio,
+            uf=uf,
+            ano=ano,
+            notes=notes,
+        )
         _log_consulta(
             pergunta=pergunta,
             resposta=resposta,
@@ -550,7 +868,12 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
     contexto_llm = list(contexto or [])[:MAX_RAG_CARTAS_LLM]
     logger.info("[CHATBOT] depois RAG cartas=%s", len(contexto_llm))
 
-    dados_para_llm = _compact_dados_para_llm(dados_calculados, intent, dados_ui if isinstance(dados_ui, pd.DataFrame) else None)
+    if intent == "panorama":
+        dados_para_llm = _compact_panorama_para_llm(dados_calculados)
+    else:
+        dados_para_llm = _compact_dados_para_llm(
+            dados_calculados, intent, dados_ui if isinstance(dados_ui, pd.DataFrame) else None
+        )
     logger.info(
         "[CHATBOT] payload LLM linhas=%s rag=%s",
         dados_para_llm.get("_limite_llm", {}).get("linhas_enviadas_ao_llm", 0),
@@ -574,12 +897,18 @@ def answer_question(pergunta: str, filtros_ui: dict[str, Any] | None = None) -> 
         filtros={"tipo_consulta": intent, **filtros_rag, "filtros_ui": filtros_ui},
     )
 
+    gerar_grafico = _should_show_comparacao_chart(
+        interpretacao, pergunta, dados_ui if isinstance(dados_ui, pd.DataFrame) else pd.DataFrame(), intent
+    )
+
     return {
         "resposta": resposta,
         "dados": dados_ui,
         "contexto": contexto,
         "filtros": filtros_rag,
         "tipo_consulta": intent,
+        "gerar_grafico": gerar_grafico,
+        "metrica_grafico": metrica,
         "interpretacao": {k: v for k, v in interpretacao.items() if not str(k).startswith("_")},
     }
 

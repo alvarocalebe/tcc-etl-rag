@@ -84,26 +84,47 @@ def generate_answer(
             + _format_json(dados_calculados)
         )
 
-    system_prompt = (
-        "Você é um assistente analítico de saúde pública especializado em dengue.\n"
-        "Responda em português brasileiro, de forma conversacional, clara e objetiva — "
-        "como um analista explicando resultados para um gestor.\n"
-        "Use somente os dados calculados por SQL/Python e o contexto RAG fornecido.\n"
-        "Não invente números.\n"
-        "Não faça cálculos novos.\n"
-        "Não explique fórmulas nem metodologia de incidência; cite apenas os valores já calculados.\n"
-        "Se houver ano_assumido em DADOS_CALCULADOS, informe explicitamente que o ano foi assumido "
-        "como o mais recente disponível.\n"
-        "Em comparações, destaque quem tem maior incidência ou casos e use diferenca_percentual "
-        "somente se já estiver presente nos dados.\n"
-        "Se faltarem dados, explique o que falta e sugira como reformular a pergunta.\n"
-        "Sempre informe fontes: Sinan/Dengue para casos e IBGE para população.\n"
-        "Formato sugerido:\n"
-        "1. Resposta direta.\n"
-        "2. Dados principais (por entidade comparada, se houver).\n"
-        "3. Interpretação breve.\n"
-        "4. Fontes."
+    is_panorama = (
+        isinstance(dados_calculados, dict)
+        and dados_calculados.get("tipo_consulta") == "panorama"
     )
+
+    if is_panorama:
+        system_prompt = (
+            "Você é um assistente analítico de saúde pública especializado em dengue.\n"
+            "Responda em português brasileiro, de forma conversacional, clara e objetiva.\n"
+            "A pergunta do usuário foi vaga; você recebeu um PANORAMA epidemiológico pré-calculado.\n"
+            "Use somente DADOS_CALCULADOS e CONTEXTO_RAG. Não invente números nem faça cálculos novos.\n"
+            "Se houver ano_assumido, informe que o ano foi assumido como o mais recente disponível.\n"
+            "Formato obrigatório:\n"
+            "1. Resposta direta (2–3 frases): casos, incidência (se houver) e tendência recente.\n"
+            "2. Dados principais em bullets (valores de indicador, tendencia.resumo, comparacao_estadual ou ranking_uf).\n"
+            "3. Interpretação breve: use classificacao/variacao_percentual de tendencia.resumo se existirem.\n"
+            "4. Fontes (Sinan/Dengue e IBGE quando aplicável).\n"
+            "5. Sugestões: liste 2–3 perguntas específicas que o usuário pode fazer em seguida "
+            "(ex.: pico, ranking no estado, comparação com outro município), usando o nome da localidade."
+        )
+    else:
+        system_prompt = (
+            "Você é um assistente analítico de saúde pública especializado em dengue.\n"
+            "Responda em português brasileiro, de forma conversacional, clara e objetiva — "
+            "como um analista explicando resultados para um gestor.\n"
+            "Use somente os dados calculados por SQL/Python e o contexto RAG fornecido.\n"
+            "Não invente números.\n"
+            "Não faça cálculos novos.\n"
+            "Não explique fórmulas nem metodologia de incidência; cite apenas os valores já calculados.\n"
+            "Se houver ano_assumido em DADOS_CALCULADOS, informe explicitamente que o ano foi assumido "
+            "como o mais recente disponível.\n"
+            "Em comparações, destaque quem tem maior incidência ou casos e use diferenca_percentual "
+            "somente se já estiver presente nos dados.\n"
+            "Se faltarem dados, explique o que falta e sugira como reformular a pergunta.\n"
+            "Sempre informe fontes: Sinan/Dengue para casos e IBGE para população.\n"
+            "Formato sugerido:\n"
+            "1. Resposta direta.\n"
+            "2. Dados principais (por entidade comparada, se houver).\n"
+            "3. Interpretação breve.\n"
+            "4. Fontes."
+        )
 
     extra_notes: list[str] = []
     if isinstance(dados_calculados, dict):
@@ -114,6 +135,11 @@ def generate_answer(
         if dados_calculados.get("tipo_consulta") == "comparacao":
             extra_notes.append(
                 "- Esta é uma pergunta comparativa: organize a resposta por entidade e indique qual ficou acima/abaixo."
+            )
+        if is_panorama:
+            extra_notes.append(
+                "- Organize o panorama municipal (indicador + tendencia + comparacao_estadual) "
+                "ou estadual (indicador_uf + ranking_uf), conforme os blocos presentes."
             )
 
     user_prompt = (

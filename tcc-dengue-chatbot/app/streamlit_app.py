@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app import chatbot, db, llm, queries
+from app import charts, chatbot, db, llm, queries
 
 
 st.set_page_config(
@@ -97,10 +97,12 @@ if n_fato <= 0:
 st.subheader("Pergunte")
 
 suggestions = [
+    "Quero saber sobre Serra Talhada",
     "Qual foi a incidência de dengue em Palmas TO em 2025?",
     "Quantos casos de dengue houve em Palmas TO em 2025?",
     "Quais municípios do TO tiveram maior incidência em 2025?",
     "Compare Palmas e Araguaína em 2025.",
+    "Gere um gráfico comparativo entre Palmas TO e o Paraná em 2025.",
     "Compare a média do Paraná com a média de Palmas TO.",
     "A dengue está aumentando em Palmas TO nas últimas semanas?",
     "Palmas está acima da média do Tocantins em 2025?",
@@ -165,7 +167,27 @@ def _render_result(result: dict) -> None:
     else:
         st.caption("Dados não disponíveis neste formato.")
 
-    if tipo_consulta in {"serie_semanal", "tendencia"} and isinstance(dados, pd.DataFrame) and not dados.empty:
+    if tipo_consulta == "comparacao" and isinstance(dados, pd.DataFrame):
+        metrica = result.get("metrica_grafico") or interpretacao.get("metrica") or "casos"
+        comp_fig = charts.build_comparacao_figure(
+            dados,
+            metrica=str(metrica),
+            titulo="Comparação epidemiológica",
+        )
+        if comp_fig is not None and result.get("gerar_grafico"):
+            st.markdown("### Gráfico comparativo")
+            st.plotly_chart(comp_fig, use_container_width=True)
+        elif interpretacao.get("gerar_grafico") and not dados.empty:
+            st.caption(
+                "Não foi possível gerar o gráfico: são necessários pelo menos dois locais "
+                "com dados comparáveis (municípios, UFs ou combinação)."
+            )
+        elif interpretacao.get("gerar_grafico") and dados.empty:
+            st.caption(
+                "Não foi possível gerar o gráfico: informe pelo menos duas localidades para comparar."
+            )
+
+    if tipo_consulta in {"serie_semanal", "tendencia", "panorama"} and isinstance(dados, pd.DataFrame) and not dados.empty:
         if "semana_epidemiologica" in dados.columns and "casos" in dados.columns:
             dfp = dados.sort_values(["ano", "semana_epidemiologica"]) if "ano" in dados.columns else dados.sort_values(["semana_epidemiologica"])
             fig = go.Figure()
